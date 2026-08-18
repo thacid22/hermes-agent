@@ -14,10 +14,11 @@ import os
 import json
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Union
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
+from hermes_constants import parse_reasoning_effort
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
@@ -596,7 +597,7 @@ class SessionResetPolicy:
 @dataclass
 class ChannelOverride:
     """
-    Per-channel override for model, provider, system prompt, and reasoning effort.
+    Per-channel override for model, provider, reasoning, and system prompt.
 
     Used in config under platforms.<name>.channel_overrides[channel_id].
     Enables different channels (e.g. Discord #daily vs #dev) to use different
@@ -605,7 +606,7 @@ class ChannelOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
-    reasoning_effort: Optional[Any] = None
+    reasoning_effort: Optional[Union[str, bool]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -623,11 +624,26 @@ class ChannelOverride:
     def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
         if not data:
             return cls()
+
+        reasoning_effort = data.get("reasoning_effort")
+        if reasoning_effort is not None:
+            parsed_reasoning = parse_reasoning_effort(reasoning_effort)
+            if parsed_reasoning is None:
+                logger.warning(
+                    "Unknown reasoning_effort '%s'; ignoring channel override "
+                    "and inheriting configured reasoning",
+                    reasoning_effort,
+                )
+                reasoning_effort = None
+            elif parsed_reasoning.get("enabled"):
+                reasoning_effort = parsed_reasoning["effort"]
+            else:
+                reasoning_effort = False
         return cls(
             model=data.get("model"),
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
-            reasoning_effort=data.get("reasoning_effort"),
+            reasoning_effort=reasoning_effort,
         )
 
 
@@ -686,7 +702,8 @@ class PlatformConfig:
     # Telegram, Matrix, …) ignore it.
     typing_status_text: Optional[str] = None
 
-    # Per-channel model/provider/system_prompt/reasoning overrides (channel_id -> ChannelOverride)
+    # Per-channel model/provider/reasoning/system_prompt overrides
+    # (channel_id -> ChannelOverride)
     channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
 
     # Platform-specific settings

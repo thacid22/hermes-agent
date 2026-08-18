@@ -967,6 +967,9 @@ def init_agent(
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+    # A gateway session/lane can pin reasoning for the whole turn so provider
+    # fallback does not replace it with a global per-model setting.
+    agent._reasoning_config_fixed = False
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns

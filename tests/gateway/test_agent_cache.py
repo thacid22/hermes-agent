@@ -3,7 +3,7 @@
 Verifies that the agent cache correctly:
 - Reuses agents across messages (same config → same instance)
 - Rebuilds agents when config changes (model, provider, toolsets)
-- Updates reasoning_config in-place without rebuilding
+- Rebuilds when effective reasoning changes and reuses when it stays equal
 - Evicts on session reset
 - Evicts on fallback activation
 - Preserves frozen system prompt across turns
@@ -79,7 +79,6 @@ class TestAgentConfigSignature:
             GatewayRunner._agent_config_signature("gpt-5.6", plain, [], "")
         )
 
-
     def test_default_gateway_runtime_forwards_filtered_capabilities(self, monkeypatch):
         """Configured provider capabilities must reach a newly created gateway agent."""
         from gateway.run import _resolve_runtime_agent_kwargs
@@ -105,6 +104,28 @@ class TestAgentConfigSignature:
         runtime = _resolve_runtime_agent_kwargs()
 
         assert runtime["capabilities"] == {"openai_native_compaction": True}
+
+    def test_reasoning_change_busts_signature_and_same_value_reuses(self):
+        """Different lane reasoning cannot reuse stale cached-agent state."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
+        low = {"enabled": True, "effort": "low"}
+        high = {"enabled": True, "effort": "high"}
+        sig_low = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-discord"], "",
+            reasoning_config=low,
+        )
+        sig_high = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-discord"], "",
+            reasoning_config=high,
+        )
+        sig_low_again = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-discord"], "",
+            reasoning_config=low,
+        )
+        assert sig_low != sig_high
+        assert sig_low == sig_low_again
 
     # ---------------------------------------------------------------
     # cache_keys (compression/context config cache-busting)
