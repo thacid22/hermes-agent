@@ -1330,13 +1330,28 @@ def _sanitize_consumer_codex_request(
     is_consumer_codex = (
         bool(backend_predicate()) if callable(backend_predicate) else False
     )
-    if is_consumer_codex and "prompt_cache_retention" in sanitized:
-        sanitized.pop("prompt_cache_retention")
-        logger.warning(
-            "Dropped unsupported prompt_cache_retention at consumer Codex "
-            "wire boundary (model=%s).",
-            sanitized.get("model", getattr(agent, "model", "unknown")),
-        )
+    if is_consumer_codex:
+        dropped_retention = False
+        if "prompt_cache_retention" in sanitized:
+            sanitized.pop("prompt_cache_retention")
+            dropped_retention = True
+
+        extra_body = sanitized.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_retention" in extra_body:
+            sanitized_extra_body = dict(extra_body)
+            sanitized_extra_body.pop("prompt_cache_retention")
+            if sanitized_extra_body:
+                sanitized["extra_body"] = sanitized_extra_body
+            else:
+                sanitized.pop("extra_body")
+            dropped_retention = True
+
+        if dropped_retention:
+            logger.warning(
+                "Dropped unsupported prompt_cache_retention at consumer Codex "
+                "wire boundary (model=%s).",
+                sanitized.get("model", getattr(agent, "model", "unknown")),
+            )
     return sanitized
 
 

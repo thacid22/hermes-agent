@@ -590,15 +590,88 @@ def test_run_codex_stream_strips_relay_added_retention_at_consumer_wire(
     )
 
 
+def test_run_codex_stream_strips_nested_request_override_retention(
+    monkeypatch,
+    caplog,
+):
+    """Retention carried through extra_body cannot bypass the wire guard."""
+    from agent.transports.codex import ResponsesApiTransport
+
+    agent = _build_agent(monkeypatch)
+    captured = {}
+
+    def _fake_create(**kwargs):
+        captured.update(kwargs)
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            )
+        ])
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=_fake_create),
+    )
+    request = ResponsesApiTransport().build_kwargs(
+        model="gpt-5.6-sol",
+        messages=[
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ],
+        tools=[],
+        is_codex_backend=True,
+        base_url="https://chatgpt.com/backend-api/codex",
+        request_overrides={
+            "extra_body": {"prompt_cache_retention": "24h"},
+        },
+    )
+    assert request["extra_body"] == {"prompt_cache_retention": "24h"}
+
+    with caplog.at_level("WARNING", logger="agent.codex_runtime"):
+        agent._run_codex_stream(request)
+
+    assert "extra_body" not in captured
+    assert request["extra_body"] == {"prompt_cache_retention": "24h"}
+    assert any(
+        "Dropped unsupported prompt_cache_retention at consumer Codex wire boundary"
+        in record.message
+        for record in caplog.records
+    )
+
+
+def test_consumer_codex_wire_guard_copies_nested_body_before_cleanup():
+    from agent.codex_runtime import _sanitize_consumer_codex_request
+
+    agent = SimpleNamespace(_is_codex_backend=lambda: True)
+    request = {
+        "model": "gpt-5.6-sol",
+        "extra_body": {
+            "prompt_cache_retention": "24h",
+            "provider_extension": "keep-me",
+        },
+    }
+
+    sanitized = _sanitize_consumer_codex_request(agent, request)
+
+    assert sanitized["extra_body"] == {"provider_extension": "keep-me"}
+    assert sanitized["extra_body"] is not request["extra_body"]
+    assert request["extra_body"]["prompt_cache_retention"] == "24h"
+
+
 def test_consumer_codex_wire_guard_preserves_compatible_endpoint_retention():
     from agent.codex_runtime import _sanitize_consumer_codex_request
 
     agent = SimpleNamespace(_is_codex_backend=lambda: False)
-    request = {"model": "openai.gpt-5.5", "prompt_cache_retention": "24h"}
+    request = {
+        "model": "openai.gpt-5.5",
+        "prompt_cache_retention": "24h",
+        "extra_body": {"prompt_cache_retention": "24h"},
+    }
 
     sanitized = _sanitize_consumer_codex_request(agent, request)
 
     assert sanitized["prompt_cache_retention"] == "24h"
+    assert sanitized["extra_body"]["prompt_cache_retention"] == "24h"
     assert sanitized is not request
 
 
