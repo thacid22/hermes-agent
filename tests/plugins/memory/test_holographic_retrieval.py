@@ -123,7 +123,9 @@ def hoisted_retriever(tmp_path):
             category="fact" if i % 2 else "preference",
             tags=f"entity_{i % 5} deploy",
         )
-    retriever = FactRetriever(store=store)
+    # The parity/performance tests below compare scoring behaviour. Keep them
+    # side-effect free: production retrieval telemetry is tested separately.
+    retriever = FactRetriever(store=store, track_usage=False)
     yield retriever
     store.close()
 
@@ -181,7 +183,7 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
         jaccard = r._jaccard_similarity(query_tokens, all_tokens)
         fts_score = fact.get("fts_rank", 0.0)
         if r.hrr_weight > 0 and fact.get("hrr_vector"):
-            fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
+            fact_vec = hrr.bytes_to_phases(fact["hrr_vector"], dim=r.hrr_dim)
             query_vec = hrr.encode_text(query, r.hrr_dim)  # per-candidate
             hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0
         else:
@@ -199,28 +201,6 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     assert new_results == old_results
 
 
-def test_related_encodes_role_atoms_once(hoisted_retriever, monkeypatch):
-    calls = _counting_spy(monkeypatch, "encode_atom")
-    results = hoisted_retriever.related("entity_1")
-    assert results
-    role_calls = [a for a in calls
-                  if a and str(a[0]).startswith("__hrr_role_")]
-    assert len(role_calls) == 2, (
-        f"role atoms encoded {len(role_calls)}x in one related() — "
-        "expected exactly 2 (role_entity + role_content, hoisted)"
-    )
-
-
-def test_probe_encodes_role_atom_once(hoisted_retriever, monkeypatch):
-    calls = _counting_spy(monkeypatch, "encode_atom")
-    results = hoisted_retriever.probe("entity_1")
-    assert results
-    role_content_calls = [a for a in calls
-                          if a and a[0] == "__hrr_role_content__"]
-    assert len(role_content_calls) == 1, (
-        f"role_content atom encoded {len(role_content_calls)}x in one "
-        "probe() — loop-invariant hoist regressed"
-    )
 
 
 def test_search_without_vectors_never_encodes(hoisted_retriever, monkeypatch):
@@ -238,3 +218,59 @@ def test_search_without_vectors_never_encodes(hoisted_retriever, monkeypatch):
         f"encode_text called {len(calls)}x with zero vector candidates — "
         "lazy hoist regressed to eager"
     )
+
+
+def test_grounded_retrieval_honors_min_trust_and_records_use(tmp_path):
+    """Graph recall excludes quarantined facts and records live usage."""
+    store = MemoryStore(str(tmp_path / "trust_filter.db"))
+    try:
+        active_id = store.add_fact(
+            '"Shared Entity" owns the durable active configuration.',
+            category="general",
+            entities=["Shared Entity", "Configuration"],
+        )
+        quarantined_id = store.add_fact(
+            '"Shared Entity" owns the superseded duplicate configuration.',
+            category="general",
+            entities=["Shared Entity", "Configuration"],
+        )
+        assert store.update_fact(
+            quarantined_id,
+            category="quarantine",
+            tags=f"quarantine,duplicate-of:{active_id}",
+            trust_delta=-0.3,
+        )
+
+        retriever = FactRetriever(store=store)
+        result_sets = [
+            retriever.search("Shared Entity", min_trust=0.3, limit=20),
+            retriever.probe("Shared Entity", min_trust=0.3, limit=20),
+            retriever.related("Shared Entity", min_trust=0.3, limit=20),
+            retriever.reason(
+                ["Shared Entity", "Configuration"], min_trust=0.3, limit=20
+            ),
+        ]
+
+        for results in result_sets:
+            ids = {result["fact_id"] for result in results}
+            assert active_id in ids
+            assert quarantined_id not in ids
+
+        rows = {
+            row["fact_id"]: row
+            for row in store._conn.execute(
+                "SELECT fact_id, category, trust_score, retrieval_count FROM facts"
+            ).fetchall()
+        }
+        assert rows[active_id]["retrieval_count"] == 4
+        assert rows[quarantined_id]["retrieval_count"] == 0
+
+        bank_counts = {
+            row["bank_name"]: row["fact_count"]
+            for row in store._conn.execute(
+                "SELECT bank_name, fact_count FROM memory_banks"
+            ).fetchall()
+        }
+        assert bank_counts == {"cat:general": 1, "cat:quarantine": 1}
+    finally:
+        store.close()

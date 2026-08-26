@@ -509,6 +509,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        memory_provider_tools_only: bool = False,
         skip_background_review: bool = False,
         session_db=None,
         parent_session_id: str = None,
@@ -600,6 +601,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            memory_provider_tools_only=memory_provider_tools_only,
             skip_background_review=skip_background_review,
             session_db=session_db,
             parent_session_id=parent_session_id,
@@ -7063,10 +7065,15 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        *,
+        attempts: int | None = None,
+    ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(self, reason, attempts=attempts)
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.

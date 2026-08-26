@@ -407,10 +407,20 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        external_prefetch_timeout: Optional[float] = None,
+        tools_only: bool = False,
+    ) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        # Tool-only managers exist for guarded cron/background agents that need
+        # provider-native mutation tools without treating the harness prompt as
+        # user conversation. Tool schema/dispatch and clean shutdown stay live;
+        # every context, recall, sync, mirroring, and lifecycle hook is fenced.
+        self._tools_only = bool(tools_only)
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
             if external_prefetch_timeout is None
@@ -528,6 +538,8 @@ class MemoryManager:
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
         """
+        if self._tools_only:
+            return ""
         blocks = []
         for provider in self._providers:
             try:
@@ -567,6 +579,8 @@ class MemoryManager:
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        if self._tools_only:
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -648,6 +662,8 @@ class MemoryManager:
         Returns ``""`` when no provider injected memory this turn — callers can
         emit the result unconditionally.
         """
+        if self._tools_only:
+            return ""
         segments: List[str] = []
         for provider in self._providers:
             try:
@@ -677,6 +693,8 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
+        if self._tools_only:
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -736,6 +754,8 @@ class MemoryManager:
         before turn N+1; provider implementations don't need their own
         ordering guarantees.
         """
+        if self._tools_only:
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -942,6 +962,8 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        if self._tools_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -953,6 +975,8 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        if self._tools_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -991,7 +1015,7 @@ class MemoryManager:
         ``_submit_background`` degrades to inline execution — the pre-#16454
         synchronous behavior, slow but correct.
         """
-        if not self._providers:
+        if self._tools_only or not self._providers:
             return
         snapshot = list(messages or [])
 
@@ -1036,7 +1060,7 @@ class MemoryManager:
         transcript was truncated; providers caching per-turn document
         state should invalidate.
         """
-        if not new_session_id:
+        if self._tools_only or not new_session_id:
             return
         # Only forward ``rewound`` when it's actually set. Passing it
         # unconditionally would inject ``rewound=False`` into every
@@ -1104,6 +1128,8 @@ class MemoryManager:
         its exception is propagated so the caller can preserve the
         uncompressed transcript.
         """
+        if self._tools_only:
+            return ""
         parts = []
         checkpoint_succeeded = False
         for provider in self._providers:
@@ -1179,6 +1205,8 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        if self._tools_only:
+            return
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -1245,7 +1273,7 @@ class MemoryManager:
         session/task/tool-call provenance the manager does not) invoked once per
         mirrored op.
         """
-        if not self._memory_tool_result_succeeded(tool_result):
+        if self._tools_only or not self._memory_tool_result_succeeded(tool_result):
             return
 
         target = str(tool_args.get("target") or "memory")
@@ -1282,6 +1310,8 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        if self._tools_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_delegation(

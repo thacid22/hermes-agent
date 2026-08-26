@@ -64,6 +64,10 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+# After a confirmed transport/server outage activates a fallback, avoid probing
+# the primary again on the very next user message. The active task already stays
+# on the fallback; this short circuit-breaker spans nearby follow-up turns.
+_PRIMARY_OUTAGE_FALLBACK_COOLDOWN_S = 60.0
 
 
 def _context_thread_target(callback):
@@ -2459,7 +2463,12 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    attempts: int | None = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2511,6 +2520,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             )
         return False
     fb = agent._fallback_chain[agent._fallback_index]
+    from hermes_cli.fallback_config import (
+        fallback_entry_allowed_reasons,
+        fallback_entry_allows_reason,
+        fallback_reason_name,
+    )
+
+    if not fallback_entry_allows_reason(fb, reason):
+        reason_name = fallback_reason_name(reason) or "unspecified"
+        allowed = fallback_entry_allowed_reasons(fb) or ()
+        allowed_text = ", ".join(allowed) if allowed else "none"
+        logger.warning(
+            "Automatic fallback blocked by activate_on policy: provider=%s "
+            "model=%s reason=%s allowed=%s",
+            fb.get("provider"), fb.get("model"), reason_name, allowed_text,
+        )
+        agent._buffer_status(
+            "🛑 Automatic fallback blocked by policy "
+            f"(reason={reason_name}; allowed={allowed_text})."
+        )
+        return False
     agent._fallback_index += 1
     fb_key = _fallback_entry_key(fb)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
@@ -2519,11 +2548,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, attempts=attempts)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return agent._try_activate_fallback(reason, attempts=attempts)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2534,7 +2563,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, attempts=attempts)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2559,7 +2588,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, attempts=attempts)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2616,7 +2645,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return agent._try_activate_fallback(reason, attempts=attempts)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2827,31 +2856,47 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Shared chokepoint: per-model override > global reasoning_effort
         # (YAML boolean False = disabled). Wrapped in try/except because a
         # config load failure must not kill the swap.
-        try:
-            from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
+        if getattr(agent, "_reasoning_config_fixed", False) is not True:
+            try:
+                from hermes_cli.config import load_config
+                from hermes_constants import resolve_reasoning_config
 
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
+                agent.reasoning_config = resolve_reasoning_config(
+                    load_config() or {}, agent.model
+                )
+                logger.info(
+                    "Fallback %s: reasoning_config resolved: %s",
+                    agent.model, agent.reasoning_config,
+                )
+            except Exception as _reasoning_err:
+                logger.debug(
+                    "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
+                    agent.model, _reasoning_err,
+                )
+                # Keep whatever reasoning_config was active — don't break the fallback swap.
+
+        if reason in {
+            FailoverReason.timeout,
+            FailoverReason.overloaded,
+            FailoverReason.server_error,
+        }:
+            existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
+            agent._rate_limited_until = max(
+                existing_cooldown,
+                time.monotonic() + _PRIMARY_OUTAGE_FALLBACK_COOLDOWN_S,
             )
-            logger.info(
-                "Fallback %s: reasoning_config resolved: %s",
-                agent.model, agent.reasoning_config,
-            )
-        except Exception as _reasoning_err:
-            logger.debug(
-                "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
-                agent.model, _reasoning_err,
-            )
-            # Keep whatever reasoning_config was active — don't break the fallback swap.
 
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
+        reason_name = fallback_reason_name(reason) or "unspecified"
+        reason_text = _fallback_reason_text(reason)
+        if isinstance(attempts, int) and attempts > 0:
+            reason_text = f"{reason_text}, primary attempts={attempts}"
         notice = (
             f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-            f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
+            f"({reason_text}); using {fb_model} via {fb_provider}."
         )
         # The buffered switch is surfaced on terminal failure. A successful
         # fallback clears retry chatter, so retain every switch as a durable
@@ -2870,8 +2915,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._provider_fallback_active = True
         agent._provider_fallback_route = (str(fb_model), str(fb_provider))
         logger.info(
-            "Fallback activated: %s → %s (%s)",
-            old_model, fb_model, fb_provider,
+            "Fallback activated: %s → %s (%s) reason=%s primary_attempts=%s",
+            old_model, fb_model, fb_provider, reason_name,
+            attempts if isinstance(attempts, int) and attempts > 0 else "unknown",
         )
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would
@@ -2883,7 +2929,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return agent._try_activate_fallback(reason, attempts=attempts)  # try next in chain
 
 
 

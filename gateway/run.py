@@ -2838,9 +2838,11 @@ def _resolve_runtime_agent_kwargs() -> dict:
         # must not mislabel a quota exhaustion as an auth failure (#32790).
         if is_rate_limited_auth_error(auth_exc):
             logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
+            fallback_reason = "rate_limit"
         else:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
+            fallback_reason = "auth"
+        fb_config = _try_resolve_fallback_provider(reason=fallback_reason)
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
@@ -2891,7 +2893,10 @@ class _GatewayModelContext:
     context_source: str
 
 
-def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModelContext:
+def _resolve_gateway_model_context(
+    model: Optional[str] = None,
+    runtime_kwargs: Optional[dict] = None,
+) -> _GatewayModelContext:
     """Resolve the configured gateway route and its effective context window.
 
     This is the shared non-resident authority for status/session banners and
@@ -2936,7 +2941,11 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         pass
 
     try:
-        runtime = _resolve_runtime_agent_kwargs()
+        runtime = (
+            runtime_kwargs
+            if runtime_kwargs is not None
+            else _resolve_runtime_agent_kwargs()
+        )
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
@@ -3036,8 +3045,14 @@ def _credential_pool_for_provider(provider: Optional[str]):
         return None
 
 
-def _try_resolve_fallback_provider() -> dict | None:
-    """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
+def _try_resolve_fallback_provider(*, reason: object = None) -> dict | None:
+    """Resolve a pre-agent fallback allowed for the classified ``reason``.
+
+    Legacy entries without ``activate_on`` retain broad init-time behavior.
+    Strict entries are filtered before credentials are resolved so a denied
+    auth/client condition cannot activate a paid route outside AIAgent's
+    normal fallback boundary.
+    """
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         # Canonical gateway loader: managed overlay + ${VAR} expansion +
@@ -3049,7 +3064,21 @@ def _try_resolve_fallback_provider() -> dict | None:
             return None
         for entry in fb_list:
             try:
-                from hermes_cli.fallback_config import resolve_entry_api_key
+                from hermes_cli.fallback_config import (
+                    fallback_entry_allows_reason,
+                    fallback_reason_name,
+                    resolve_entry_api_key,
+                )
+
+                if not fallback_entry_allows_reason(entry, reason):
+                    logger.warning(
+                        "Pre-agent fallback blocked by activate_on policy: "
+                        "provider=%s model=%s reason=%s",
+                        entry.get("provider"),
+                        entry.get("model"),
+                        fallback_reason_name(reason) or "unspecified",
+                    )
+                    continue
 
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
@@ -5416,6 +5445,10 @@ class TurnRunner:
             session_key=ctx.session_key,
             model=model,
         )
+        reasoning_is_scoped = self._runner._has_scoped_reasoning_override(
+            source=ctx.source,
+            session_key=ctx.session_key,
+        )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -5873,6 +5906,7 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        setattr(agent, "_reasoning_config_fixed", reasoning_is_scoped)
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Must-deliver notes for THIS turn ride the current user message
@@ -9532,9 +9566,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides.
+        """Resolve reasoning effort for a session, honoring scoped overrides.
 
-        Priority: session-scoped ``/reasoning --session`` override >
+        Priority: session-scoped ``/reasoning`` override > channel override >
         per-model override (``agent.reasoning_overrides``) > global
         ``agent.reasoning_effort``. ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
@@ -9552,7 +9586,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+
+        config = getattr(self, "config", None)
+        if config and source is not None:
+            override = _get_channel_override(
+                config,
+                source.platform,
+                str(source.chat_id or ""),
+                thread_id=(
+                    str(source.thread_id)
+                    if getattr(source, "thread_id", None)
+                    else None
+                ),
+                parent_id=(
+                    str(source.parent_chat_id)
+                    if getattr(source, "parent_chat_id", None)
+                    else None
+                ),
+            )
+            if override and override.reasoning_effort is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                channel_reasoning = parse_reasoning_effort(
+                    override.reasoning_effort
+                )
+                if channel_reasoning is not None:
+                    return channel_reasoning
         return self._load_reasoning_config(model)
+
+    def _has_scoped_reasoning_override(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> bool:
+        """Return whether session/channel reasoning must stay fixed this turn."""
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+
+        if resolved_session_key:
+            state = self._peek_session_state(resolved_session_key)
+            if state is not None and state.conversation.reasoning_override is not None:
+                return True
+
+        config = getattr(self, "config", None)
+        if config and source is not None:
+            override = _get_channel_override(
+                config,
+                source.platform,
+                str(source.chat_id or ""),
+                thread_id=(
+                    str(source.thread_id)
+                    if getattr(source, "thread_id", None)
+                    else None
+                ),
+                parent_id=(
+                    str(source.parent_chat_id)
+                    if getattr(source, "parent_chat_id", None)
+                    else None
+                ),
+            )
+            if override and override.reasoning_effort is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                return parse_reasoning_effort(override.reasoning_effort) is not None
+        return False
 
     def _set_session_reasoning_override(
         self,
@@ -21498,17 +21600,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                model, runtime_kwargs = self._reset_notice_route_for_source(source)
+                return self._format_session_info(model, runtime_kwargs)
+        model, runtime_kwargs = self._reset_notice_route_for_source(source)
+        return self._format_session_info(model, runtime_kwargs)
 
-    def _format_session_info(self) -> str:
+    def _reset_notice_route_for_source(
+        self, source: SessionSource
+    ) -> tuple[str, dict]:
+        """Resolve the fresh session's channel route without restoring /model state.
+
+        A reset clears conversation-scoped model choices.  Its banner must
+        therefore reflect the remaining channel override (or global route),
+        rather than calling the general session resolver, which can rehydrate
+        the old session's persisted ``/model`` choice while rendering.
+        """
+        chat_id = str(source.chat_id) if source.chat_id else ""
+        thread_id = str(source.thread_id) if source.thread_id else None
+        parent_id = str(source.parent_chat_id) if source.parent_chat_id else None
+        model = self._resolve_model_for_channel(
+            source.platform,
+            chat_id,
+            thread_id=thread_id,
+            parent_id=parent_id,
+        )
+        channel_override = _get_channel_override(
+            self.config,
+            source.platform,
+            chat_id,
+            thread_id=thread_id,
+            parent_id=parent_id,
+        )
+        if channel_override and channel_override.provider:
+            runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                channel_override.provider
+            )
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        return model, runtime_kwargs
+
+    def _format_session_info(
+        self,
+        model: Optional[str] = None,
+        runtime_kwargs: Optional[dict] = None,
+    ) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
         """
-        resolved = _resolve_gateway_model_context()
+        resolved = _resolve_gateway_model_context(model, runtime_kwargs)
         model = resolved.model
         provider = resolved.provider
         base_url = resolved.base_url
@@ -23046,6 +23188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
+            reasoning_is_scoped = self._has_scoped_reasoning_override(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -23099,6 +23242,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                setattr(agent, "_reasoning_config_fixed", reasoning_is_scoped)
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,

@@ -259,6 +259,27 @@ def start_review(
     goal, context = build_review_task(snapshot, user_prompt, loaded_skills)
     credentials_cfg = _load_review_credentials_cfg()
 
+    from agent.auxiliary_client import auxiliary_openrouter_route_blocked
+
+    if credentials_cfg:
+        route_provider = credentials_cfg.get("provider") or ""
+        route_base_url = credentials_cfg.get("base_url") or ""
+        route_client = None
+    else:
+        runtime = parent_agent._current_main_runtime()
+        route_provider = parent_agent.provider or ""
+        route_base_url = runtime.get("base_url") or ""
+        route_client = getattr(parent_agent, "client", None)
+    if auxiliary_openrouter_route_blocked(
+        provider=route_provider,
+        base_url=route_base_url,
+        client=route_client,
+    ):
+        raise ValueError(
+            "Review dispatch blocked: OpenRouter auxiliary routes are disabled "
+            "by auxiliary.allow_openrouter=false"
+        )
+
     from tools.delegate_tool import delegate_task
 
     raw = delegate_task(

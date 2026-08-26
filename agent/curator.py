@@ -1890,6 +1890,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _base_url = None
     _api_mode = None
     _resolved_provider = None
+    _provider = ""
     _credential_pool = None
     _request_overrides: Dict[str, Any] = {}
     _max_tokens = None
@@ -1927,6 +1928,19 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
 
     result_meta["model"] = _model_name
     result_meta["provider"] = _resolved_provider or ""
+
+    from agent.auxiliary_client import auxiliary_openrouter_route_blocked
+
+    if auxiliary_openrouter_route_blocked(
+        provider=_resolved_provider or _provider or "",
+        base_url=_base_url or "",
+    ):
+        result_meta["error"] = (
+            "Curator review blocked: OpenRouter auxiliary routes are disabled "
+            "by auxiliary.allow_openrouter=false"
+        )
+        result_meta["summary"] = result_meta["error"]
+        return result_meta
 
     review_agent = None
     try:

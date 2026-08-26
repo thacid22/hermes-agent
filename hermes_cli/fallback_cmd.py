@@ -53,7 +53,12 @@ def _format_entry(entry: Dict[str, Any]) -> str:
     model = entry.get("model", "?")
     base = entry.get("base_url")
     suffix = f"  [{base}]" if base else ""
-    return f"{model}  (via {provider}){suffix}"
+    policy = entry.get("activate_on")
+    policy_suffix = ""
+    if isinstance(policy, (list, tuple)):
+        reasons = ", ".join(str(reason) for reason in policy if str(reason).strip())
+        policy_suffix = f"  [automatic on: {reasons or 'nothing'}]"
+    return f"{model}  (via {provider}){suffix}{policy_suffix}"
 
 
 def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[Dict[str, Any]]:

@@ -99,7 +99,11 @@ class TestListCommand:
         _write_config(isolated_home, {
             "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
             "fallback_providers": [
-                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+                {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "activate_on": ["timeout", "server_error"],
+                },
                 {"provider": "nous", "model": "Hermes-4"},
             ],
         })
@@ -108,6 +112,7 @@ class TestListCommand:
         out = capsys.readouterr().out
         assert "Fallback chain (2 entries)" in out
         assert "anthropic/claude-sonnet-4.6" in out
+        assert "automatic on: timeout, server_error" in out
         assert "Hermes-4" in out
         # Primary should be shown too
         assert "claude-sonnet-4-6" in out

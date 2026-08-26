@@ -1,7 +1,7 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import resolve_entry_api_key
+from hermes_cli.fallback_config import fallback_entry_allows_reason, resolve_entry_api_key
 
 
 class TestResolveEntryApiKey:
@@ -37,3 +37,38 @@ class TestResolveEntryApiKey:
         # secret scope installed, resolution still reads os.environ.
         monkeypatch.setenv("FB_KEY", "env-key")
         assert resolve_entry_api_key({"key_env": "FB_KEY"}) == "env-key"
+
+
+class TestFallbackActivationPolicy:
+    def test_legacy_entry_without_policy_allows_existing_behavior(self):
+        entry = {"provider": "openrouter", "model": "openrouter/auto"}
+        assert fallback_entry_allows_reason(entry, None) is True
+        assert fallback_entry_allows_reason(entry, "format_error") is True
+
+    def test_strict_policy_fails_closed_without_an_explicit_reason(self):
+        entry = {
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+        }
+        assert fallback_entry_allows_reason(entry, None) is False
+
+    def test_strict_policy_allows_only_named_availability_reasons(self):
+        entry = {
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+        }
+        for reason in ("timeout", "overloaded", "server_error", "rate_limit"):
+            assert fallback_entry_allows_reason(entry, reason) is True
+        assert fallback_entry_allows_reason(entry, "upstream_rate_limit") is True
+        for reason in (
+            "format_error",
+            "content_policy_blocked",
+            "context_overflow",
+            "model_not_found",
+            "auth",
+            "billing",
+            "unknown",
+        ):
+            assert fallback_entry_allows_reason(entry, reason) is False

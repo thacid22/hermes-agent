@@ -40,6 +40,47 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
     return None
 
 
+def fallback_reason_name(reason: Any) -> str:
+    """Return the normalized config-facing name for a failover reason."""
+    value = getattr(reason, "value", reason)
+    return str(value or "").strip().lower()
+
+
+def fallback_entry_allowed_reasons(entry: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return an entry's strict activation allowlist, or None for legacy mode.
+
+    Absence of ``activate_on`` preserves Hermes' historical broad fallback
+    behavior. Presence is fail-closed: malformed/empty values allow nothing.
+    """
+    if not isinstance(entry, dict) or "activate_on" not in entry:
+        return None
+    raw = entry.get("activate_on")
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = ()
+    return tuple(
+        dict.fromkeys(
+            normalized
+            for item in values
+            if (normalized := fallback_reason_name(item))
+        )
+    )
+
+
+def fallback_entry_allows_reason(entry: dict[str, Any] | None, reason: Any) -> bool:
+    """Whether one automatic fallback entry may activate for ``reason``."""
+    allowed = fallback_entry_allowed_reasons(entry)
+    if allowed is None:
+        return True
+    reason_name = fallback_reason_name(reason)
+    if reason_name == "upstream_rate_limit" and "rate_limit" in allowed:
+        return True
+    return bool(reason_name and reason_name in allowed)
+
+
 def _iter_fallback_entries(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, dict):
         candidates = [raw]

@@ -347,6 +347,14 @@ def _resolve_review_runtime(
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
+    from agent.auxiliary_client import auxiliary_openrouter_route_blocked
+
+    if auxiliary_openrouter_route_blocked(
+        provider=parent["provider"] or "",
+        base_url=parent["base_url"] or "",
+        client=getattr(agent, "client", None),
+    ):
+        parent["blocked"] = True
     task = _background_review_task_config(task_cfg)
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
@@ -364,7 +372,7 @@ def _resolve_review_runtime(
             explicit_api_key=task_api_key,
             explicit_base_url=task_base_url,
         )
-        return {
+        resolved = {
             "provider": rp.get("provider") or task_provider,
             "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
@@ -377,6 +385,12 @@ def _resolve_review_runtime(
             "args": list(rp.get("args") or []),
             "routed": True,
         }
+        if auxiliary_openrouter_route_blocked(
+            provider=resolved["provider"] or "",
+            base_url=resolved["base_url"] or "",
+        ):
+            return {**resolved, "blocked": True}
+        return resolved
     except Exception as e:
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
@@ -1141,6 +1155,18 @@ def _run_review_in_thread(
     except Exception:
         pass
 
+    policy_runtime = _resolve_review_runtime(agent, task_cfg)
+    if policy_runtime.get("blocked"):
+        logger.warning(
+            "Background review skipped: OpenRouter auxiliary route is disabled "
+            "by auxiliary.allow_openrouter=false"
+        )
+        try:
+            _set_approval_callback(None)
+        except Exception:
+            pass
+        return
+
     # An agent-as-provider whose client can't carry Hermes tool calls back would
     # produce a fork that spawns a whole agent and then cannot write anything.
     # Don't spawn it — point at the override that does work. Checked BEFORE the
@@ -1149,7 +1175,7 @@ def _run_review_in_thread(
     # Fixes the class, not one provider: any future agent-as-provider client
     # inherits the guard.
     if not _parent_can_emit_tool_calls(agent) and not bool(
-        _resolve_review_runtime(agent, task_cfg).get("routed")
+        policy_runtime.get("routed")
     ):
         logger.warning(
             "Background review skipped: provider %r cannot emit Hermes tool calls, "
@@ -1220,7 +1246,7 @@ def _run_review_in_thread(
             # set auxiliary.background_review.{provider,model} to a different
             # model — that model's runtime (routed=True). The codex_app_server
             # -> codex_responses downgrade is applied inside the resolver.
-            _rt = _resolve_review_runtime(agent, task_cfg)
+            _rt = policy_runtime
             _routed = bool(_rt.get("routed"))
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,

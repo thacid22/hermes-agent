@@ -24,12 +24,23 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
-from utils import is_truthy_value
-from .store import MemoryStore
-from .retrieval import FactRetriever
+from tools.lazy_deps import FeatureUnavailable, ensure
 from hermes_cli.config import cfg_get
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# The provider can fall back to FTS/Jaccard when NumPy is unavailable, but that
+# fallback previously made the "holographic" layer fail silently and left new
+# facts without vectors. Ask Hermes' guarded lazy-dependency system to provide
+# the pinned runtime before importing the HRR modules.
+try:
+    ensure("memory.holographic")
+except FeatureUnavailable as exc:
+    logger.warning("Holographic HRR runtime unavailable; using FTS fallback: %s", exc)
+
+from .store import MemoryStore
+from .retrieval import FactRetriever
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +56,7 @@ FACT_STORE_SCHEMA = {
         "ACTIONS (simple → powerful):\n"
         "• add — Store a fact the user would expect you to remember.\n"
         "• search — Keyword lookup ('editor config', 'deploy process').\n"
-        "• probe — Entity recall: ALL facts about a person/thing.\n"
+        "• probe — Entity recall grounded in explicit links, with keyword fallback only when unresolved.\n"
         "• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
@@ -57,14 +68,23 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "get", "search", "probe", "related", "reason", "contradict", "update", "quarantine", "restore", "resolve_event", "remove", "list"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
-            "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
-            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
-            "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
+            "entities": {"type": "array", "items": {"type": "string"}, "description": "Explicit entity names for add/update, or entity names for reason."},
+            "fact_id": {"type": "integer", "description": "Fact ID for get/update/quarantine/remove."},
+            "related_fact_id": {"type": "integer", "description": "Canonical/superseding fact ID for quarantine."},
+            "relation_type": {"type": "string", "enum": ["duplicate_of", "superseded_by"], "description": "Reversible quarantine relationship."},
+            "evidence": {"type": "string", "description": "Concrete source or decision evidence."},
+            "source_type": {"type": "string", "enum": ["user_explicit", "user_correction", "assistant_inferred", "live_verified", "archive", "manual"]},
+            "source_session_id": {"type": "string", "description": "Source session ID for provenance."},
+            "volatility": {"type": "string", "enum": ["stable", "mutable", "ephemeral"]},
+            "event_id": {"type": "integer", "description": "Curation event ID for resolve_event."},
+            "event_status": {"type": "string", "enum": ["applied", "rejected", "deferred", "error"]},
+            "resolution_note": {"type": "string"},
+            "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general", "quarantine"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
@@ -148,7 +168,8 @@ class HolographicMemoryProvider(MemoryProvider):
         _default_db = f"{display_hermes_home()}/memory_store.db"
         return [
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
-            {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
+            {"key": "auto_extract", "description": "Legacy direct extraction at session end", "default": "false", "choices": ["true", "false"]},
+            {"key": "event_capture", "description": "Queue strict direct-user candidates for guarded curation", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
         ]
@@ -177,6 +198,8 @@ class HolographicMemoryProvider(MemoryProvider):
             hrr_dim=hrr_dim,
         )
         self._session_id = session_id
+        self._agent_context = str(kwargs.get("agent_context") or "primary")
+        self._platform = str(kwargs.get("platform") or "")
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -217,10 +240,57 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
-        pass
+    def _config_enabled(self, key: str, default: bool = False) -> bool:
+        value = self._config.get(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        """Queue strict direct-user retention candidates for the curator.
+
+        This is deliberately not auto-extraction: no fact is written here. The
+        weekly curator must compare the candidate with live facts, retain only
+        durable explicit statements, and resolve the event with provenance.
+        """
+        if not self._store or getattr(self, "_agent_context", "primary") != "primary":
+            return
+        if not self._config_enabled("event_capture"):
+            return
+        content = " ".join(str(user_content or "").split()).strip()
+        if len(content) < 12 or len(content) > 1200:
+            return
+        direct = re.search(
+            r"(?i)(?:^|[.!?]\s+)(?:actually,?\s+)?(?:"
+            r"i\s+(?:prefer|always|never|usually|do\s+not\s+want|don't\s+want)\b|"
+            r"from\s+now\s+on\b|remember\s+that\b|when\s+i\s+ask\b)",
+            content,
+        )
+        if not direct:
+            return
+        source_type = "user_correction" if re.match(r"(?i)^actually\b", content) else "user_explicit"
+        volatility = "mutable" if re.search(
+            r"(?i)\b(current version|currently installed|job id|channel id|port \d+|pid \d+)\b",
+            content,
+        ) else "stable"
+        self._store.enqueue_event(
+            "retention_candidate",
+            session_id=session_id or getattr(self, "_session_id", ""),
+            payload={
+                "source_type": source_type,
+                "volatility": volatility,
+                "evidence": content,
+                "platform": getattr(self, "_platform", ""),
+                "candidate_category": "user_pref",
+            },
+        )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
@@ -242,14 +312,50 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
-                category = "user_pref" if target == "user" else "general"
-                self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        """Mirror committed built-in memory writes with source provenance.
+
+        Replace/remove retire only the compact source; they never delete a deep
+        Holographic fact. The append-only fact event preserves that distinction.
+        """
+        if not self._store:
+            return
+        meta = dict(metadata or {})
+        session_id = str(meta.get("session_id") or self._session_id or "")
+        source_type = "manual"
+        category = "user_pref" if target == "user" else "general"
+        idempotency = str(meta.get("tool_call_id") or "")
+        if idempotency:
+            idempotency = f"builtin-memory:{idempotency}:{action}:{target}"
+        try:
+            fact_id = None
+            if action in {"add", "replace"} and content:
+                fact_id = self._store.add_fact(
+                    content,
+                    category=category,
+                    tags=f"builtin-memory,source-target:{target}",
+                    provenance={
+                        "source_type": source_type,
+                        "session_id": session_id,
+                        "evidence": content,
+                        "volatility": "stable",
+                    },
+                )
+            self._store.append_fact_event(
+                fact_id,
+                f"builtin_memory_{action}",
+                after={"content": content, "target": target} if content else {},
+                metadata=meta,
+                idempotency_key=idempotency or None,
+            )
+        except Exception as exc:
+            logger.warning("Holographic memory_write mirror failed: %s", exc)
 
     def shutdown(self) -> None:
         # Release the shared SQLite connection deterministically on the
@@ -273,14 +379,30 @@ class HolographicMemoryProvider(MemoryProvider):
             action = args["action"]
             store = self._store
             retriever = self._retriever
+            if store is None or retriever is None:
+                return tool_error("Holographic memory provider is not initialized")
 
             if action == "add":
+                provenance = None
+                if args.get("source_type"):
+                    provenance = {
+                        "source_type": args["source_type"],
+                        "session_id": args.get("source_session_id", ""),
+                        "evidence": args.get("evidence", ""),
+                        "volatility": args.get("volatility", "stable"),
+                    }
                 fact_id = store.add_fact(
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
+                    entities=args.get("entities") or None,
+                    provenance=provenance,
                 )
-                return json.dumps({"fact_id": fact_id, "status": "added"})
+                return json.dumps({"fact_id": fact_id, "status": "added", "fact": store.get_fact(fact_id)})
+
+            elif action == "get":
+                fact = store.get_fact(int(args["fact_id"]))
+                return json.dumps({"fact": fact, "found": fact is not None})
 
             elif action == "search":
                 results = retriever.search(
@@ -295,6 +417,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 results = retriever.probe(
                     args["entity"],
                     category=args.get("category"),
+                    min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
@@ -303,6 +426,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 results = retriever.related(
                     args["entity"],
                     category=args.get("category"),
+                    min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
@@ -314,6 +438,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 results = retriever.reason(
                     entities,
                     category=args.get("category"),
+                    min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
@@ -321,6 +446,7 @@ class HolographicMemoryProvider(MemoryProvider):
             elif action == "contradict":
                 results = retriever.contradict(
                     category=args.get("category"),
+                    min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
@@ -333,7 +459,34 @@ class HolographicMemoryProvider(MemoryProvider):
                     tags=args.get("tags"),
                     category=args.get("category"),
                 )
-                return json.dumps({"updated": updated})
+                if updated and args.get("entities") is not None:
+                    store.link_entities(int(args["fact_id"]), args.get("entities") or [], replace=True)
+                return json.dumps({"updated": updated, "fact": store.get_fact(int(args["fact_id"])) if updated else None})
+
+            elif action == "quarantine":
+                result = store.quarantine_fact(
+                    int(args["fact_id"]),
+                    related_fact_id=int(args["related_fact_id"]),
+                    relation_type=args["relation_type"],
+                    evidence=args["evidence"],
+                )
+                return json.dumps({"quarantined": True, **result})
+
+            elif action == "restore":
+                result = store.restore_fact(
+                    int(args["fact_id"]),
+                    evidence=args["evidence"],
+                )
+                return json.dumps(result)
+
+            elif action == "resolve_event":
+                result = store.resolve_event(
+                    int(args["event_id"]),
+                    args["event_status"],
+                    fact_id=int(args["fact_id"]) if args.get("fact_id") is not None else None,
+                    note=args.get("resolution_note", ""),
+                )
+                return json.dumps({"resolved": True, "event": result})
 
             elif action == "remove":
                 removed = store.remove_fact(int(args["fact_id"]))

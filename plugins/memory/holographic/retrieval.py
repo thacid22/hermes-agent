@@ -30,10 +30,12 @@ class FactRetriever:
         jaccard_weight: float = 0.3,
         hrr_weight: float = 0.3,
         hrr_dim: int = 1024,
+        track_usage: bool = True,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
         self.hrr_dim = hrr_dim
+        self.track_usage = track_usage
 
         # Auto-redistribute weights if numpy unavailable
         if hrr_weight > 0 and not hrr._HAS_NUMPY:
@@ -119,240 +121,118 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        self._record_retrievals(results)
         return results
 
     def probe(
         self,
         entity: str,
         category: str | None = None,
+        min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
-        """Compositional entity query using HRR algebra.
-
-        Unbinds entity from memory bank to extract associated content.
-        This is NOT keyword search — it uses algebraic structure to find facts
-        where the entity plays a structural role.
-
-        Falls back to FTS5 search if numpy unavailable.
-        """
-        if not hrr._HAS_NUMPY:
-            # Fallback to keyword search on entity name
-            return self.search(entity, category=category, limit=limit)
-
-        conn = self.store._conn
-
-        # Encode entity as role-bound vector
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-        entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
-        probe_key = hrr.bind(entity_vec, role_entity)
-
-        # Try category-specific bank first, then all facts
-        if category:
-            bank_name = f"cat:{category}"
-            bank_row = conn.execute(
-                "SELECT vector FROM memory_banks WHERE bank_name = ?",
-                (bank_name,),
-            ).fetchone()
-            if bank_row:
-                bank_vec = hrr.bytes_to_phases(bank_row["vector"], dim=self.hrr_dim)
-                extracted = hrr.unbind(bank_vec, probe_key)
-                # Use extracted signal to score individual facts
-                return self._score_facts_by_vector(
-                    extracted, category=category, limit=limit
-                )
-
-        # Score against individual fact vectors directly
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
-        if category:
-            where += " AND category = ?"
-            params.append(category)
-
-        rows = conn.execute(
-            f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
-            """,
-            params,
-        ).fetchall()
-
-        if not rows:
-            # Final fallback: keyword search
-            return self.search(entity, category=category, limit=limit)
-
-        # role_content is loop-invariant — encode it once (deterministic
-        # SHA-256-based atom) instead of once per fact row.
-        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-        scored = []
-        for row in rows:
-            fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
-            # Unbind probe key from fact to see if entity is structurally present
-            residual = hrr.unbind(fact_vec, probe_key)
-            # Compare residual against content signal
-            content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
-            sim = hrr.similarity(residual, content_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
-            scored.append(fact)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        """Return facts explicitly linked to an entity, then HRR-rerank them."""
+        ids = self.store.fact_ids_for_entity(
+            entity, category=category, min_trust=min_trust
+        )
+        if not ids:
+            # Unresolved entities retain a keyword fallback, but never receive
+            # arbitrary vector-neighbour results presented as entity recall.
+            return self.search(
+                entity, category=category, min_trust=min_trust, limit=limit
+            )
+        results = self._facts_by_ids(ids, query=entity, limit=limit)
+        self._record_retrievals(results)
+        return results
 
     def related(
         self,
         entity: str,
         category: str | None = None,
+        min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
-        """Discover facts that share structural connections with an entity.
-
-        Unlike probe (which finds facts *about* an entity), related finds
-        facts that are connected through shared context — e.g., other entities
-        mentioned alongside this one, or content that overlaps structurally.
-
-        Falls back to FTS5 search if numpy unavailable.
-        """
-        if not hrr._HAS_NUMPY:
-            return self.search(entity, category=category, limit=limit)
-
-        conn = self.store._conn
-
-        # Encode entity as a bare atom (not role-bound — we want ANY structural match)
-        entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
-
-        # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
+        """Return graph-adjacent facts through entities shared with seed facts."""
+        seed_ids = self.store.fact_ids_for_entity(
+            entity, category=category, min_trust=min_trust
+        )
+        if not seed_ids:
+            return self.search(
+                entity, category=category, min_trust=min_trust, limit=limit
+            )
+        placeholders = ",".join("?" for _ in seed_ids)
+        entity_rows = self.store._conn.execute(
+            f"SELECT DISTINCT entity_id FROM fact_entities WHERE fact_id IN ({placeholders})",
+            seed_ids,
+        ).fetchall()
+        entity_ids = [int(row["entity_id"]) for row in entity_rows]
+        if not entity_ids:
+            return self.probe(entity, category=category, min_trust=min_trust, limit=limit)
+        entity_placeholders = ",".join("?" for _ in entity_ids)
+        params: list = [*entity_ids, min_trust]
+        category_sql = (
+            "AND f.category != 'quarantine' "
+            "AND f.tags NOT LIKE '%dream-quarantine%' "
+            "AND f.tags NOT LIKE '%quarantine%'"
+        )
         if category:
-            where += " AND category = ?"
+            category_sql += " AND f.category = ?"
             params.append(category)
-
-        rows = conn.execute(
+        rows = self.store._conn.execute(
             f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
+            SELECT f.fact_id, COUNT(DISTINCT fe.entity_id) AS shared_entities
+            FROM facts f
+            JOIN fact_entities fe ON fe.fact_id = f.fact_id
+            WHERE fe.entity_id IN ({entity_placeholders})
+              AND f.trust_score >= ? {category_sql}
+            GROUP BY f.fact_id
+            ORDER BY shared_entities DESC, f.trust_score DESC, f.fact_id
             """,
             params,
         ).fetchall()
-
-        if not rows:
-            return self.search(entity, category=category, limit=limit)
-
-        # Score each fact by how much the entity's atom appears in its vector
-        # This catches both role-bound entity matches AND content word matches
-        # Both role atoms are loop-invariant — encode them once here
-        # (deterministic SHA-256-based atoms) instead of twice per fact row.
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-        scored = []
-        for row in rows:
-            fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
-
-            # Check structural similarity: unbind entity from fact
-            residual = hrr.unbind(fact_vec, entity_vec)
-            # A high-similarity residual to ANY known role vector means this entity
-            # plays a structural role in the fact
-
-            entity_role_sim = hrr.similarity(residual, role_entity)
-            content_role_sim = hrr.similarity(residual, role_content)
-            # Take the max — entity could appear in either role
-            best_sim = max(entity_role_sim, content_role_sim)
-
-            fact["score"] = (best_sim + 1.0) / 2.0 * fact["trust_score"]
-            scored.append(fact)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        scores = {int(row["fact_id"]): int(row["shared_entities"]) for row in rows}
+        results = self._facts_by_ids(list(scores), query=entity, limit=limit)
+        for fact in results:
+            fact["shared_entities"] = scores.get(int(fact["fact_id"]), 0)
+            fact["score"] *= max(1, fact["shared_entities"])
+        results.sort(key=lambda row: row["score"], reverse=True)
+        results = results[:limit]
+        self._record_retrievals(results)
+        return results
 
     def reason(
         self,
         entities: list[str],
         category: str | None = None,
+        min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
-        """Multi-entity compositional query — vector-space JOIN.
-
-        Given multiple entities, algebraically intersects their structural
-        connections to find facts related to ALL of them simultaneously.
-        This is compositional reasoning that no embedding DB can do.
-
-        Example: reason(["peppi", "backend"]) finds facts where peppi AND
-        backend both play structural roles — without keyword matching.
-
-        Falls back to FTS5 search if numpy unavailable.
-        """
-        if not hrr._HAS_NUMPY or not entities:
-            # Fallback: search with all entities as keywords
-            query = " ".join(entities)
-            return self.search(query, category=category, limit=limit)
-
-        conn = self.store._conn
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-
-        # For each entity, compute what the bank "remembers" about it
-        # by unbinding entity+role from each fact vector
-        entity_residuals = []
-        for entity in entities:
-            entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
-            probe_key = hrr.bind(entity_vec, role_entity)
-            entity_residuals.append(probe_key)
-
-        # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
-        if category:
-            where += " AND category = ?"
-            params.append(category)
-
-        rows = conn.execute(
-            f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
-            """,
-            params,
-        ).fetchall()
-
-        if not rows:
-            query = " ".join(entities)
-            return self.search(query, category=category, limit=limit)
-
-        # Score each fact by how much EACH entity is structurally present.
-        # A fact scores high only if ALL entities have structural presence
-        # (AND semantics via min, vs OR which would use mean/max).
-        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-
-        scored = []
-        for row in rows:
-            fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
-
-            entity_scores = []
-            for probe_key in entity_residuals:
-                residual = hrr.unbind(fact_vec, probe_key)
-                sim = hrr.similarity(residual, role_content)
-                entity_scores.append(sim)
-
-            min_sim = min(entity_scores)
-            fact["score"] = (min_sim + 1.0) / 2.0 * fact["trust_score"]
-            scored.append(fact)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        """Return the explicit AND-intersection of facts linked to every entity."""
+        if not entities:
+            return []
+        linked_sets = [
+            set(self.store.fact_ids_for_entity(
+                entity, category=category, min_trust=min_trust
+            ))
+            for entity in entities
+        ]
+        if any(not ids for ids in linked_sets):
+            # If entity resolution is incomplete, do not fabricate a vector JOIN.
+            return []
+        fact_ids = sorted(set.intersection(*linked_sets))
+        if not fact_ids:
+            return []
+        results = self._facts_by_ids(
+            fact_ids, query=" ".join(entities), limit=limit
+        )
+        self._record_retrievals(results)
+        return results
 
     def contradict(
         self,
         category: str | None = None,
         threshold: float = 0.3,
+        min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
         """Find potentially contradictory facts via entity overlap + content divergence.
@@ -369,9 +249,11 @@ class FactRetriever:
 
         conn = self.store._conn
 
-        # Get all facts with vectors and their linked entities
-        where = "WHERE f.hrr_vector IS NOT NULL"
-        params: list = []
+        # Get all trusted facts with vectors and their linked entities
+        where = "WHERE f.hrr_vector IS NOT NULL AND f.trust_score >= ?"
+        params: list = [min_trust]
+        where += " AND f.category != 'quarantine'"
+        where += " AND f.tags NOT LIKE '%dream-quarantine%' AND f.tags NOT LIKE '%quarantine%'"
         if category:
             where += " AND f.category = ?"
             params.append(category)
@@ -455,17 +337,50 @@ class FactRetriever:
         contradictions.sort(key=lambda x: x["contradiction_score"], reverse=True)
         return contradictions[:limit]
 
+    def _facts_by_ids(
+        self,
+        fact_ids: list[int],
+        *,
+        query: str,
+        limit: int,
+    ) -> list[dict]:
+        """Load a grounded candidate set and use HRR only for reranking."""
+        if not fact_ids:
+            return []
+        placeholders = ",".join("?" for _ in fact_ids)
+        rows = self.store._conn.execute(
+            f"SELECT * FROM facts WHERE fact_id IN ({placeholders})",
+            fact_ids,
+        ).fetchall()
+        query_vec = hrr.encode_text(query, self.hrr_dim) if hrr._HAS_NUMPY else None
+        query_tokens = self._tokenize(query)
+        results: list[dict] = []
+        for row in rows:
+            fact = dict(row)
+            raw_vector = fact.pop("hrr_vector", None)
+            if query_vec is not None and raw_vector:
+                similarity = (hrr.similarity(query_vec, hrr.bytes_to_phases(raw_vector, dim=self.hrr_dim)) + 1.0) / 2.0
+            else:
+                similarity = self._jaccard_similarity(
+                    query_tokens, self._tokenize(fact.get("content", ""))
+                )
+            fact["score"] = (0.5 + 0.5 * similarity) * float(fact["trust_score"])
+            results.append(fact)
+        results.sort(key=lambda row: (row["score"], row["fact_id"]), reverse=True)
+        return results[:limit]
+
     def _score_facts_by_vector(
         self,
         target_vec: "np.ndarray",
         category: str | None = None,
+        min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
-        """Score facts by similarity to a target vector."""
+        """Score trusted facts by similarity to a target vector."""
         conn = self.store._conn
 
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
+        where = "WHERE hrr_vector IS NOT NULL AND trust_score >= ?"
+        params: list = [min_trust]
         if category:
             where += " AND category = ?"
             params.append(category)
@@ -492,6 +407,40 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
+    def _record_retrievals(self, results: list[dict]) -> None:
+        """Persist retrieval telemetry for every public recall path.
+
+        The quarantine ledger relies on retrieval_count. Historically only the
+        lower-level MemoryStore search updated it, while FactRetriever bypassed
+        that method, leaving every fact at zero despite real use.
+        """
+        if not self.track_usage:
+            return
+        ids = sorted({int(fact["fact_id"]) for fact in results if fact.get("fact_id") is not None})
+        if not ids:
+            return
+        try:
+            with self.store._lock:
+                self.store._conn.executemany(
+                    """
+                    UPDATE facts
+                    SET retrieval_count = retrieval_count + 1,
+                        shown_count = shown_count + 1,
+                        last_retrieved_at = CURRENT_TIMESTAMP
+                    WHERE fact_id = ?
+                    """,
+                    [(fact_id,) for fact_id in ids],
+                )
+                self.store._conn.commit()
+            for fact in results:
+                if fact.get("fact_id") in ids:
+                    fact["retrieval_count"] = int(fact.get("retrieval_count") or 0) + 1
+        except Exception:
+            try:
+                self.store._conn.rollback()
+            except Exception:
+                pass
+
     def _fts_candidates(
         self,
         query: str,
@@ -516,6 +465,9 @@ class FactRetriever:
         # any significant term can match.
         params.append(self._sanitize_fts_query(query))
 
+        where_clauses.append("f.category != 'quarantine'")
+        where_clauses.append("f.tags NOT LIKE '%dream-quarantine%'")
+        where_clauses.append("f.tags NOT LIKE '%quarantine%'")
         if category:
             where_clauses.append("f.category = ?")
             params.append(category)

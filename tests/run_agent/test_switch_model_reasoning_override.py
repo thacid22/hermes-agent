@@ -25,6 +25,7 @@ class TestSwitchModelReasoningOverride:
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
         agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent._reasoning_config_fixed = False
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._fallback_chain = []
@@ -74,6 +75,52 @@ class TestSwitchModelReasoningOverride:
 
         assert hasattr(agent, "_primary_runtime")
         assert "reasoning_config" in agent._primary_runtime
+
+    def test_unscoped_reasoning_re_resolves_on_model_switch(self):
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent()
+        switched_reasoning = {"enabled": True, "effort": "xhigh"}
+        with (
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch(
+                "hermes_constants.resolve_reasoning_config",
+                return_value=switched_reasoning,
+            ) as resolve_reasoning,
+        ):
+            switch_model(
+                agent,
+                new_model="claude-opus-4.5",
+                new_provider="anthropic",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+            )
+
+        assert agent.reasoning_config == switched_reasoning
+        resolve_reasoning.assert_called_once()
+
+    def test_scoped_reasoning_survives_model_switch(self):
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent()
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        agent._reasoning_config_fixed = True
+        with (
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch(
+                "hermes_constants.resolve_reasoning_config"
+            ) as resolve_reasoning,
+        ):
+            switch_model(
+                agent,
+                new_model="claude-opus-4.5",
+                new_provider="anthropic",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+            )
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+        resolve_reasoning.assert_not_called()
 
 
 

@@ -3365,13 +3365,30 @@ def _run_single_child(
                 logger.debug("Could not remove child from active_children: %s", e)
 
         # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
+        # background processes, httpx clients) so subagent subprocesses do not
+        # outlive the delegation.  A hard timeout is different: Future.result()
+        # stops waiting but does not stop the daemon worker.  Closing the child
+        # here while run_conversation() is still unwinding can close its owned
+        # SessionDB or Codex/httpx client under an in-flight query/request.  The
+        # coredump for #gateway-sigsegv showed pysqlite query execution and
+        # pysqlite_connection_close running concurrently on those two threads.
+        # Defer the owner teardown to the Future completion boundary instead.
+        def _close_child_resources(_done_future=None) -> None:
+            try:
+                child_to_close = child
+                if child_to_close is not None and hasattr(child_to_close, "close"):
+                    child_to_close.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
+
         try:
-            if hasattr(child, "close"):
-                child.close()
+            child_future = locals().get("_child_future")
+            if child_future is not None and not child_future.done():
+                child_future.add_done_callback(_close_child_resources)
+            else:
+                _close_child_resources()
         except Exception:
-            logger.debug("Failed to close child agent after delegation")
+            logger.debug("Failed to schedule child-agent cleanup after delegation")
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop

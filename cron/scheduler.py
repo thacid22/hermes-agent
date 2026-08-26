@@ -462,11 +462,14 @@ class CronPromptInjectionBlocked(Exception):
 
 
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
-    """Toolsets a cron-spawned agent must never receive.
+    """Toolsets a cron-spawned agent must never receive by default.
 
-    Two toolsets are always disabled in cron context regardless of config:
+    Three toolsets are disabled in ordinary cron context:
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
+      - ``memory`` — prevents scheduled harness prompts from entering the
+        user's persistent representation; an explicit per-job memory grant is
+        handled separately in provider-tools-only mode
 
     ``cronjob`` is policy-denied by default (loop prevention, not a security
     boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
@@ -481,9 +484,9 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """
     cron_cfg = (cfg or {}).get("cron") or {}
     if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify"]
+        disabled = ["messaging", "clarify", "memory"]
     else:
-        disabled = ["cronjob", "messaging", "clarify"]
+        disabled = ["cronjob", "messaging", "clarify", "memory"]
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
@@ -4998,7 +5001,15 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     already guaranteed by the fallback resolution being config-local).
     """
     try:
-        if get_fallback_chain(cfg):
+        from hermes_cli.fallback_config import fallback_entry_allows_reason
+
+        fallback_chain = get_fallback_chain(cfg)
+        # Missing credentials are an auth condition. Only a legacy entry or an
+        # explicit auth-enabled strict entry can rescue that pre-agent failure.
+        if any(
+            fallback_entry_allows_reason(entry, "auth")
+            for entry in fallback_chain
+        ):
             return None
     except Exception:
         return None  # fail-open: never block on a preflight-internal error
@@ -5990,7 +6001,7 @@ def run_job(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
-        from hermes_cli.auth import AuthError
+        from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
         # would ship a named provider's stored credential to an off-host endpoint
@@ -6124,6 +6135,11 @@ def run_job(
                 str(getattr(resolve_exc, "provider", "") or "").strip().lower()
                 or primary_provider_for_drift
             )
+            fallback_reason = (
+                "rate_limit"
+                if is_auth and is_rate_limited_auth_error(resolve_exc)
+                else "auth" if is_auth else "timeout"
+            )
             reason = "auth" if is_auth else "transient network"
             logger.warning(
                 "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
@@ -6141,7 +6157,20 @@ def run_job(
                 if not fb_provider or not fb_model:
                     continue
                 try:
-                    from hermes_cli.fallback_config import resolve_entry_api_key
+                    from hermes_cli.fallback_config import (
+                        fallback_entry_allows_reason,
+                        resolve_entry_api_key,
+                    )
+
+                    if not fallback_entry_allows_reason(entry, fallback_reason):
+                        logger.warning(
+                            "Job '%s': fallback %s blocked by activate_on "
+                            "policy for reason=%s",
+                            job_id,
+                            fb_provider,
+                            fallback_reason,
+                        )
+                        continue
 
                     fb_kwargs = {
                         "requested": fb_provider,
@@ -6305,6 +6334,44 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+        _cron_disabled_toolsets = _resolve_cron_disabled_toolsets(_cfg)
+        # Cron agents normally skip external memory providers so scheduled
+        # harness prompts cannot be prefetched/synced as user conversation.
+        # A job explicitly granted the memory toolset in its own allowlist may
+        # still need the provider's tools (for example fact_store in the guarded
+        # curator). Platform defaults are deliberately insufficient: lift the
+        # cron baseline denial only for that per-job grant, only when the
+        # operator has not globally disabled memory, and load the provider in
+        # tool-only mode. Any resolution failure stays fail-closed.
+        _memory_provider_tools_only = False
+        _explicit_job_toolsets = job.get("enabled_toolsets")
+        if isinstance(_explicit_job_toolsets, list) and _explicit_job_toolsets:
+            try:
+                from agent.memory_manager import memory_provider_tools_enabled
+                from agent.skill_utils import parse_config_string_list
+
+                _user_disabled_toolsets = parse_config_string_list(
+                    ((_cfg.get("agent") or {}).get("disabled_toolsets"))
+                )
+                if "memory" not in _user_disabled_toolsets:
+                    _candidate_disabled_toolsets = [
+                        name for name in _cron_disabled_toolsets if name != "memory"
+                    ]
+                    _memory_provider_tools_only = memory_provider_tools_enabled(
+                        _explicit_job_toolsets,
+                        _candidate_disabled_toolsets,
+                    )
+                    if _memory_provider_tools_only:
+                        _cron_disabled_toolsets = _candidate_disabled_toolsets
+            except Exception:
+                logger.warning(
+                    "Job '%s': could not resolve memory-provider tool access; "
+                    "leaving memory disabled",
+                    job_id,
+                    exc_info=True,
+                )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -6324,8 +6391,8 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            enabled_toolsets=_cron_enabled_toolsets,
+            disabled_toolsets=_cron_disabled_toolsets,
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -6333,16 +6400,15 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            # Memory is enabled for cron agents like any other agent run:
-            # MEMORY.md / USER.md load into the system prompt and the memory
-            # tool follows normal toolset resolution, so jobs benefit from
-            # (and can update) the user's persistent memory.
-            skip_memory=False,
+            skip_memory=True,  # Cron system prompts would corrupt user representations
+            memory_provider_tools_only=_memory_provider_tools_only,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if job.get("reasoning_effort") is not None:
+            agent._reasoning_config_fixed = True
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

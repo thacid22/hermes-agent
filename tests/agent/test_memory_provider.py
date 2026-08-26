@@ -153,6 +153,45 @@ class TestMemoryManager:
         assert mgr.build_system_prompt() == ""
         assert mgr.prefetch_all("test") == ""
 
+    def test_tools_only_manager_exposes_tools_without_context_or_ingestion(self):
+        """Guarded cron agents may use provider tools without memory side effects."""
+        mgr = MemoryManager(tools_only=True)
+        p = FakeMemoryProvider("external", tools=[
+            {"name": "fact_store", "description": "facts", "parameters": {}}
+        ])
+        p._prompt_block = "must not enter the system prompt"
+        p._prefetch_result = "must not enter the turn"
+        mgr.add_provider(p)
+        mgr.initialize_all("cron-session", agent_context="tools_only")
+
+        assert {s["name"] for s in mgr.get_all_tool_schemas()} == {"fact_store"}
+        result = json.loads(mgr.handle_tool_call("fact_store", {"action": "list"}))
+        assert result["handled"] == "fact_store"
+        assert mgr.build_system_prompt() == ""
+        assert mgr.prefetch_all("cron harness prompt") == ""
+        assert mgr.describe_recall() == ""
+
+        mgr.on_turn_start(1, "cron harness prompt")
+        mgr.queue_prefetch_all("cron harness prompt")
+        mgr.sync_all("cron harness prompt", "report")
+        mgr.on_session_end([{"role": "user", "content": "cron harness prompt"}])
+        mgr.on_pre_compress([])
+        mgr.on_memory_write("add", "memory", "should not mirror")
+        mgr.notify_memory_tool_write(
+            {"success": True},
+            {"action": "add", "target": "memory", "content": "should not mirror"},
+        )
+        mgr.on_delegation("task", "result")
+        mgr.flush_pending(timeout=1)
+
+        assert p.prefetch_queries == []
+        assert p.queued_prefetches == []
+        assert p.synced_turns == []
+        assert p.turn_starts == []
+        assert p.session_end_called is False
+        assert p.pre_compress_called is False
+        assert p.memory_writes == []
+
     def test_add_provider(self):
         mgr = MemoryManager()
         p = FakeMemoryProvider("test1")

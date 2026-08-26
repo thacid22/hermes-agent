@@ -2898,22 +2898,63 @@ def _is_free_model(model: Optional[str]) -> bool:
     return normalized.endswith(":free") or normalized.startswith("stealth/")
 
 
-def _aux_openrouter_settings() -> Tuple[bool, str]:
-    """Read free_only and openrouter_model from config in one pass.
+def _aux_openrouter_settings() -> Tuple[bool, bool, str]:
+    """Read allow_openrouter, free_only and model from config in one pass.
 
-    Returns (free_only, model) — defaults (False, _OPENROUTER_MODEL) on any
-    config-read failure.
+    Returns (allow_openrouter, free_only, model). Config-read failure keeps
+    historical behavior: OpenRouter allowed, paid models allowed.
     """
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
 
         cfg = load_config_readonly()
+        allow_openrouter = bool(
+            cfg_get(cfg, "auxiliary", "allow_openrouter", default=True)
+        )
         free_only = bool(cfg_get(cfg, "auxiliary", "free_only", default=False))
         val = cfg_get(cfg, "auxiliary", "openrouter_model")
         model = val.strip() if isinstance(val, str) and val.strip() else _OPENROUTER_MODEL
-        return free_only, model
+        return allow_openrouter, free_only, model
     except Exception:
-        return False, _OPENROUTER_MODEL
+        return True, False, _OPENROUTER_MODEL
+
+
+def _auxiliary_openrouter_route_blocked(
+    *,
+    auxiliary_policy: bool,
+    provider: str = "",
+    base_url: str = "",
+    client: Any = None,
+) -> bool:
+    """Fail closed when an auxiliary route resolves to OpenRouter by any alias."""
+    if not auxiliary_policy or _aux_openrouter_settings()[0]:
+        return False
+    normalized_provider = _normalize_aux_provider(provider)
+    resolved_base = str(base_url or "")
+    if not resolved_base and client is not None:
+        resolved_base = str(getattr(client, "base_url", "") or "")
+        if not resolved_base:
+            inner = getattr(client, "_client", None) or getattr(client, "_real_client", None)
+            resolved_base = str(getattr(inner, "base_url", "") or "")
+    return (
+        normalized_provider == "openrouter"
+        or base_url_host_matches(resolved_base, "openrouter.ai")
+    )
+
+
+def auxiliary_openrouter_route_blocked(
+    *,
+    provider: str = "",
+    base_url: str = "",
+    client: Any = None,
+) -> bool:
+    """Public policy boundary for auxiliary full-agent routes."""
+    return _auxiliary_openrouter_route_blocked(
+        auxiliary_policy=True,
+        provider=provider,
+        base_url=base_url,
+        client=client,
+    )
 
 
 def _warn_paid_lane_once(model: str) -> None:
@@ -2931,9 +2972,25 @@ def _warn_paid_lane_once(model: str) -> None:
     )
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
-    free_only, cfg_model = _aux_openrouter_settings()
+def _try_openrouter(
+    explicit_api_key: str = None,
+    model: str = None,
+    *,
+    enforce_auxiliary_policy: bool = True,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
+    if enforce_auxiliary_policy:
+        allow_openrouter, free_only, cfg_model = _aux_openrouter_settings()
+    else:
+        # Main-model routing/fallback is governed by fallback_providers and its
+        # activate_on policy, not by auxiliary background-task settings.
+        allow_openrouter, free_only, cfg_model = True, False, _OPENROUTER_MODEL
     or_model = model or cfg_model
+    if not allow_openrouter:
+        logger.info(
+            "Auxiliary client: OpenRouter route disabled by "
+            "auxiliary.allow_openrouter=false"
+        )
+        return None, None
     if free_only and not _is_free_model(or_model):
         logger.warning(
             "Auxiliary client: auxiliary.free_only is enabled but the "
@@ -2945,7 +3002,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         )
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
-    if not _is_free_model(or_model):
+    if enforce_auxiliary_policy and not _is_free_model(or_model):
         _warn_paid_lane_once(or_model)
 
     pool_present, entry = _select_pool_entry("openrouter")
@@ -5574,6 +5631,7 @@ def _try_main_agent_model_fallback(
     try:
         client, resolved_model = resolve_provider_client(
             provider=main_provider, model=main_model,
+            auxiliary_policy=True,
         )
     except Exception:
         client, resolved_model = None, None
@@ -5839,6 +5897,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
+        auxiliary_policy=True,
     )
     if client is not None:
         try:
@@ -5949,6 +6008,7 @@ def _resolve_single_provider(
         model=model,
         explicit_base_url=base_url,
         explicit_api_key=api_key,
+        auxiliary_policy=True,
     )
     return client
 
@@ -6103,6 +6163,7 @@ def _resolve_auto_route(
                 explicit_base_url=explicit_base_url,
                 explicit_api_key=explicit_api_key,
                 api_mode=runtime_api_mode or None,
+                auxiliary_policy=True,
             )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -6298,6 +6359,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    auxiliary_policy: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -6325,6 +6387,9 @@ def resolve_provider_client(
             "codex_responses", or None (auto-detect).  When set to
             "codex_responses", the client is wrapped in
             CodexAuxiliaryClient to route through the Responses API.
+        auxiliary_policy: Apply auxiliary.allow_openrouter/free_only gates.
+            Main-agent selection and fallback leave this false; auxiliary
+            callers pass true.
 
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
@@ -6338,6 +6403,21 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    route_hint = str(
+        explicit_base_url
+        or ((main_runtime or {}).get("base_url") if isinstance(main_runtime, dict) else "")
+        or ""
+    )
+    if _auxiliary_openrouter_route_blocked(
+        auxiliary_policy=auxiliary_policy,
+        provider=provider,
+        base_url=route_hint,
+    ):
+        logger.info(
+            "resolve_provider_client: auxiliary OpenRouter route blocked "
+            "by auxiliary.allow_openrouter=false"
+        )
+        return None, None
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -6489,12 +6569,21 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter(
+            explicit_api_key=explicit_api_key,
+            enforce_auxiliary_policy=auxiliary_policy,
+        )
         if client is None:
-            logger.warning(
-                "resolve_provider_client: openrouter requested but %s",
-                _describe_openrouter_unavailable(),
-            )
+            if auxiliary_policy and not _aux_openrouter_settings()[0]:
+                logger.info(
+                    "resolve_provider_client: auxiliary OpenRouter route disabled "
+                    "by auxiliary.allow_openrouter=false"
+                )
+            else:
+                logger.warning(
+                    "resolve_provider_client: openrouter requested but %s",
+                    _describe_openrouter_unavailable(),
+                )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -6623,6 +6712,16 @@ def resolve_provider_client(
             if _main_base and _main_key:
                 custom_base = _main_base
                 custom_key = _main_key
+        if custom_base and _auxiliary_openrouter_route_blocked(
+            auxiliary_policy=auxiliary_policy,
+            provider=provider,
+            base_url=custom_base,
+        ):
+            logger.info(
+                "resolve_provider_client: auxiliary custom route to OpenRouter "
+                "blocked by auxiliary.allow_openrouter=false"
+            )
+            return None, None
         if custom_base and custom_key:
             final_model = _normalize_resolved_model(
                 model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
@@ -6663,6 +6762,16 @@ def resolve_provider_client(
         for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
             client, default = try_fn()
             if client is not None:
+                if _auxiliary_openrouter_route_blocked(
+                    auxiliary_policy=auxiliary_policy,
+                    provider=provider,
+                    client=client,
+                ):
+                    logger.info(
+                        "resolve_provider_client: auxiliary custom fallback route "
+                        "to OpenRouter blocked by auxiliary.allow_openrouter=false"
+                    )
+                    continue
                 final_model = _normalize_resolved_model(model or default, provider)
                 _cbase = str(getattr(client, "base_url", "") or "")
                 # ``client.api_key`` may be a callable (Azure Foundry Entra
@@ -6720,6 +6829,16 @@ def resolve_provider_client(
             # An explicit per-task api_mode override (from _resolve_task_provider_model)
             # wins; otherwise fall back to what the provider entry declared.
             entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
+            if custom_base and _auxiliary_openrouter_route_blocked(
+                auxiliary_policy=auxiliary_policy,
+                provider=provider,
+                base_url=custom_base,
+            ):
+                logger.info(
+                    "resolve_provider_client: auxiliary named-custom route to "
+                    "OpenRouter blocked by auxiliary.allow_openrouter=false"
+                )
+                return None, None
             if custom_base:
                 final_model = _normalize_resolved_model(
                     model
@@ -6884,6 +7003,16 @@ def resolve_provider_client(
         if _free_rt is not None:
             api_key = _free_rt["api_key"]
             raw_base_url = str(_free_rt["base_url"]).rstrip("/")
+        if _auxiliary_openrouter_route_blocked(
+            auxiliary_policy=auxiliary_policy,
+            provider=provider,
+            base_url=raw_base_url,
+        ):
+            logger.info(
+                "resolve_provider_client: auxiliary provider route to OpenRouter "
+                "blocked by auxiliary.allow_openrouter=false"
+            )
+            return None, None
         if provider == "actual":
             try:
                 from hermes_cli.auth import (
@@ -7196,6 +7325,7 @@ def get_text_auxiliary_client(
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        auxiliary_policy=True,
     )
 
 
@@ -7215,6 +7345,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        auxiliary_policy=True,
     )
 
 
@@ -7373,6 +7504,7 @@ def resolve_vision_provider_client(
             explicit_api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=runtime,
+            auxiliary_policy=True,
         )
         if client is None:
             return provider_for_base_override, None, None
@@ -7507,7 +7639,8 @@ def resolve_vision_provider_client(
                     explicit_base_url=rpc_base_url,
                     explicit_api_key=rpc_api_key,
                     main_runtime=runtime,
-                    is_vision=True)
+                    is_vision=True,
+                    auxiliary_policy=True)
                 if rpc_client is not None:
                     logger.info(
                         "Vision auto-detect: using main provider %s (%s)",
@@ -8016,7 +8149,18 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
+            if _auxiliary_openrouter_route_blocked(
+                auxiliary_policy=True,
+                provider=provider,
+                base_url=str(base_url or ""),
+                client=cached_client,
+            ):
+                # Policy changed after this client was cached. Drop the cache
+                # reference before resolution so a disabled OpenRouter route
+                # cannot survive until process restart. Do not close here: a
+                # concurrent caller may still be using the same client.
+                del _client_cache[cache_key]
+            elif async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
                 # transport inside is dead — force-close and replace.
@@ -8062,7 +8206,20 @@ def _get_cached_client(
         main_runtime=runtime,
         is_vision=is_vision,
         task=task,
+        auxiliary_policy=True,
     )
+    if client is not None and _auxiliary_openrouter_route_blocked(
+        auxiliary_policy=True,
+        provider=provider,
+        base_url=str(base_url or ""),
+        client=client,
+    ):
+        logger.info(
+            "Auxiliary client cache: resolved OpenRouter route blocked by "
+            "auxiliary.allow_openrouter=false"
+        )
+        client = None
+        default_model = None
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.

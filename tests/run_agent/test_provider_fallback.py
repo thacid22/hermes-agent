@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent import chat_completion_helpers
-from agent.error_classifier import FailoverReason
+from agent.error_classifier import FailoverReason, classify_api_error
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -38,6 +38,66 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     mock.base_url = base_url
     mock.api_key = api_key
     return mock
+
+
+class _HTTPError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _strict_openrouter_agent():
+    agent = _make_agent(fallback_model=[{
+        "provider": "openrouter",
+        "model": "openrouter/auto",
+        "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+    }])
+    agent.provider = "openai-codex"
+    agent.model = "gpt-5.6-sol"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    return agent
+
+
+# ── Live-policy classifier boundary ───────────────────────────────────────
+
+
+def test_codex_http_400_classifies_as_format_error_and_cannot_spill_to_openrouter():
+    agent = _strict_openrouter_agent()
+    classified = classify_api_error(
+        _HTTPError(
+            400,
+            "Unsupported parameter: 'max_tokens' is not supported with this model",
+        ),
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+    )
+    assert classified.reason is FailoverReason.format_error
+    with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+        assert agent._try_activate_fallback(classified.reason, attempts=1) is False
+    resolve.assert_not_called()
+    assert agent._fallback_index == 0
+    assert agent._fallback_activated is False
+
+
+def test_codex_http_503_classifies_as_outage_and_activates_openrouter_once():
+    agent = _strict_openrouter_agent()
+    classified = classify_api_error(
+        _HTTPError(503, "service temporarily unavailable"),
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+    )
+    assert classified.reason in {
+        FailoverReason.overloaded,
+        FailoverReason.server_error,
+    }
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(_mock_client(), "openrouter/auto"),
+    ) as resolve:
+        assert agent._try_activate_fallback(classified.reason, attempts=2) is True
+    resolve.assert_called_once()
+    assert agent._fallback_index == 1
+    assert agent._fallback_activated is True
 
 
 # ── Chain initialisation ──────────────────────────────────────────────────
@@ -130,6 +190,109 @@ class TestFallbackChainAdvancement:
         )
         assert agent._pending_fallback_notice == [expected]
         assert agent._retry_status_buffer[-1] == ("status", expected)
+
+    def test_unscoped_reasoning_re_resolves_for_fallback_model(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+        )
+        setattr(agent, "reasoning_config", {"enabled": True, "effort": "high"})
+        assert getattr(agent, "_reasoning_config_fixed") is False
+
+        fallback_reasoning = {"enabled": True, "effort": "low"}
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+            patch(
+                "hermes_constants.resolve_reasoning_config",
+                return_value=fallback_reasoning,
+            ) as resolve_reasoning,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert getattr(agent, "reasoning_config") == fallback_reasoning
+        resolve_reasoning.assert_called_once()
+
+    def test_scoped_reasoning_survives_fallback(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+        )
+        setattr(agent, "reasoning_config", {"enabled": True, "effort": "high"})
+        setattr(agent, "_reasoning_config_fixed", True)
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+            patch(
+                "hermes_constants.resolve_reasoning_config"
+            ) as resolve_reasoning,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert getattr(agent, "reasoning_config") == {
+            "enabled": True,
+            "effort": "high",
+        }
+        resolve_reasoning.assert_not_called()
+
+    def test_strict_entry_denies_format_error_without_consuming_fallback(self):
+        fbs = [{
+            "provider": "openai",
+            "model": "gpt-4o",
+            "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
+            assert agent._try_activate_fallback(
+                FailoverReason.format_error,
+                attempts=1,
+            ) is False
+        assert agent._fallback_index == 0
+        assert agent._fallback_activated is False
+        mock_rpc.assert_not_called()
+
+    def test_strict_entry_denies_missing_reason_fail_closed(self):
+        fbs = [{
+            "provider": "openai",
+            "model": "gpt-4o",
+            "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
+            assert agent._try_activate_fallback(attempts=3) is False
+        assert agent._fallback_index == 0
+        mock_rpc.assert_not_called()
+
+    def test_strict_entry_allows_timeout_and_reports_reason_and_attempts(self):
+        fbs = [{
+            "provider": "openai",
+            "model": "gpt-4o",
+            "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+            patch(
+                "agent.chat_completion_helpers.time.monotonic",
+                return_value=1_000.0,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                FailoverReason.timeout,
+                attempts=2,
+            ) is True
+        assert agent._fallback_index == 1
+        assert agent._fallback_activated is True
+        assert agent._rate_limited_until == 1_060.0
+        notice = agent._pending_fallback_notice[-1]
+        assert "request timeout" in notice
+        assert "primary attempts=2" in notice
 
     def test_records_sequential_switches_in_order(self):
         agent = _make_agent(

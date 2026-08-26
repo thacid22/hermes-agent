@@ -632,15 +632,10 @@ class TestRunJobSessionPersistence:
             yield fake_db, mock_agent_cls
 
 
-    def test_run_job_memory_enabled_in_cron(self, tmp_path):
-        """Cron agents get memory like any other agent run.
-
-        skip_memory=False and the memory toolset is not policy-denied, so
-        MEMORY.md/USER.md load and the memory tool follows normal toolset
-        resolution.
-        """
+    def test_run_job_memory_toolset_disabled_in_cron(self, tmp_path):
+        """Ordinary cron sessions keep memory denied — issue #38129."""
         job = {
-            "id": "memory-enabled-job",
+            "id": "memory-hide-job",
             "name": "test",
             "prompt": "hello",
         }
@@ -648,13 +643,14 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
-        assert "memory" not in (kwargs["disabled_toolsets"] or []), (
-            "memory toolset must not be policy-denied in cron"
+        assert kwargs["skip_memory"] is True
+        assert "memory" in (kwargs["disabled_toolsets"] or []), (
+            "memory toolset should be disabled in cron to match skip_memory=True"
         )
+        assert kwargs["memory_provider_tools_only"] is False
 
-    def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
-        """A per-job enabled_toolsets naming memory keeps it."""
+    def test_run_job_enables_provider_tools_only_when_per_job_enables_memory(self, tmp_path):
+        """A guarded curator gets fact_store without memory prefetch/sync."""
         job = {
             "id": "memory-toolset-job",
             "name": "test",
@@ -665,10 +661,29 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
-        assert "memory" in (kwargs["enabled_toolsets"] or [])
-        assert "file" in (kwargs["enabled_toolsets"] or [])
+        assert kwargs["skip_memory"] is True
+        assert kwargs["enabled_toolsets"] == ["memory", "file"]
         assert "memory" not in kwargs["disabled_toolsets"]
+        assert kwargs["memory_provider_tools_only"] is True
+
+    def test_run_job_global_memory_denial_overrides_per_job_grant(self, tmp_path):
+        """Operator disabled_toolsets remains authoritative for cron."""
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  disabled_toolsets:\n    - memory\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "memory-denied-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert "memory" in kwargs["disabled_toolsets"]
+        assert kwargs["memory_provider_tools_only"] is False
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
@@ -1119,6 +1134,7 @@ class TestRunJobConfigEnvVarExpansion:
             "fallback_providers:\n"
             "  - provider: xai\n"
             "    model: grok-4.5\n"
+            "    activate_on: [timeout]\n"
             "  - provider: anthropic\n"
             "    model: claude-opus-5\n",
             encoding="utf-8",
@@ -1220,6 +1236,54 @@ class TestRunJobConfigEnvVarExpansion:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
+
+    def test_strict_auth_fallback_is_denied_before_agent_construction(self, tmp_path):
+        """A strict outage-only chain must not rescue missing/invalid auth."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.6-sol\n"
+            "  provider: openai-codex\n"
+            "cron:\n"
+            "  preflight: false\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: openrouter/auto\n"
+            "    activate_on: [timeout, overloaded, server_error, rate_limit]\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "strict-auth-denied",
+            "name": "strict auth denied",
+            "prompt": "hi",
+            "provider_snapshot": "openai-codex",
+            "model_snapshot": "gpt-5.6-sol",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if kwargs.get("requested") in (None, "openai-codex"):
+                raise AuthError("No Codex credentials stored")
+            raise AssertionError("strict fallback credentials must not be resolved")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, _, _, error = run_job(job)
+
+        assert success is False
+        assert error and "Codex credentials" in error
+        assert requested == [None]
+        mock_agent_cls.assert_not_called()
 
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):

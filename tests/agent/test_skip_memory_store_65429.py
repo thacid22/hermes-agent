@@ -12,6 +12,7 @@ gated on ``skip_memory``.
 
 import pytest
 
+from agent.memory_provider import MemoryProvider
 from run_agent import AIAgent
 
 
@@ -25,7 +26,11 @@ class _FakeOpenAI:
 
 
 def _make_agent(
-    monkeypatch, enabled_toolsets=None, disabled_toolsets=None, skip_memory=True
+    monkeypatch,
+    enabled_toolsets=None,
+    disabled_toolsets=None,
+    skip_memory=True,
+    memory_provider_tools_only=False,
 ):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
@@ -39,9 +44,32 @@ def _make_agent(
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=skip_memory,
+        memory_provider_tools_only=memory_provider_tools_only,
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
     )
+
+
+class _FakeProvider(MemoryProvider):
+    @property
+    def name(self):
+        return "fake"
+
+    def is_available(self):
+        return True
+
+    def initialize(self, session_id, **kwargs):
+        self.init_kwargs = {"session_id": session_id, **kwargs}
+
+    def get_tool_schemas(self):
+        return [{
+            "name": "fact_store",
+            "description": "test fact store",
+            "parameters": {"type": "object", "properties": {}},
+        }]
+
+    def handle_tool_call(self, tool_name, args, **kwargs):
+        return '{"ok": true}'
 
 
 def test_skip_memory_with_memory_toolset_creates_store(monkeypatch, tmp_path):
@@ -55,6 +83,12 @@ def test_skip_memory_with_memory_toolset_creates_store(monkeypatch, tmp_path):
 
 
 
+
+
+def test_skip_memory_with_composite_memory_toolset_creates_store(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    agent = _make_agent(monkeypatch, enabled_toolsets=["hermes-acp"], skip_memory=True)
+    assert agent._memory_store is not None
 
 
 def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
@@ -132,3 +166,35 @@ def test_skip_memory_disabled_toolset_does_not_load_store(monkeypatch, tmp_path)
     blob = " ".join(str(v) for v in parts.values())
     assert secret not in blob
     assert "cron-should-never-see-this-profile" not in blob
+
+
+def test_skip_memory_can_load_external_provider_in_explicit_tools_only_mode(
+    monkeypatch, tmp_path
+):
+    """The curator gets fact_store while ordinary skip-memory agents stay clean."""
+    home = tmp_path / "hm"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "memory:\n  memory_enabled: true\n  provider: fake\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    provider = _FakeProvider()
+    monkeypatch.setattr(
+        "plugins.memory.load_memory_provider",
+        lambda _name: provider,
+    )
+
+    agent = _make_agent(
+        monkeypatch,
+        enabled_toolsets=["memory"],
+        skip_memory=True,
+        memory_provider_tools_only=True,
+    )
+
+    assert agent._memory_manager is not None
+    assert agent._memory_manager._tools_only is True
+    assert provider.init_kwargs["agent_context"] == "tools_only"
+    assert "fact_store" in agent.valid_tool_names
+    assert agent._memory_manager.build_system_prompt() == ""
+    assert agent._memory_manager.prefetch_all("cron harness prompt") == ""

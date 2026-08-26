@@ -600,6 +600,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_provider_tools_only: bool = False,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -962,6 +963,10 @@ def init_agent(
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+    # Gateway session/channel overrides pin reasoning for the active turn so
+    # model switches and provider fallback cannot replace a more specific
+    # value with the per-model/global default.
+    agent._reasoning_config_fixed = False
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
@@ -1412,6 +1417,15 @@ def init_agent(
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
                     for _fb in _fb_entries:
+                        from hermes_cli.fallback_config import fallback_entry_allows_reason
+
+                        if not fallback_entry_allows_reason(_fb, None):
+                            logger.warning(
+                                "Init-time fallback blocked by activate_on policy: "
+                                "provider=%s model=%s reason=unspecified",
+                                _fb.get("provider"), _fb.get("model"),
+                            )
+                            continue
                         try:
                             from hermes_cli.fallback_config import resolve_entry_api_key
                             _fb_explicit_key = resolve_entry_api_key(_fb)
@@ -1863,8 +1877,11 @@ def init_agent(
     # skip_memory=False and take the normal path here.)
     _enabled_toolsets = agent.enabled_toolsets or []
     _disabled_toolsets = agent.disabled_toolsets or []
-    _memory_toolset_requested = (
-        "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
+    from agent.memory_manager import memory_provider_tools_enabled
+
+    _memory_toolset_requested = memory_provider_tools_enabled(
+        _enabled_toolsets,
+        _disabled_toolsets,
     )
     if not skip_memory or _memory_toolset_requested:
         try:
@@ -1892,17 +1909,26 @@ def init_agent(
     
 
 
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
+    # Memory provider plugin (external — one at a time, alongside built-in).
+    # ``memory_provider_tools_only`` is the narrow cron/background escape hatch:
+    # initialize the configured provider so its explicit tools can be used, but
+    # suppress prompt injection, prefetch, turn sync, and lifecycle ingestion.
+    # This keeps harness prompts out of user representations while allowing a
+    # guarded memory-curation job to call provider-native tools.
     agent._memory_manager = None
-    if not skip_memory:
+    _load_memory_provider = not skip_memory or (
+        memory_provider_tools_only and _memory_toolset_requested
+    )
+    if _load_memory_provider:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    tools_only=bool(memory_provider_tools_only)
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
@@ -1923,7 +1949,9 @@ def init_agent(
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
+                        "agent_context": (
+                            "tools_only" if memory_provider_tools_only else "primary"
+                        ),
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning

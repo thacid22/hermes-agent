@@ -49,6 +49,40 @@ def test_init_tries_fallback_when_primary_returns_none():
         assert agent._fallback_activated is True
 
 
+def test_init_strict_fallback_does_not_hide_missing_primary_credentials():
+    """No classified outage exists at init, so strict fallback must fail closed."""
+    fallback_resolver_called = False
+
+    def fake_resolve(provider, model=None, raw_codex=False,
+                     explicit_base_url=None, explicit_api_key=None):
+        nonlocal fallback_resolver_called
+        if provider == "tencent-token-plan":
+            fallback_resolver_called = True
+            return _mock_client(), "kimi2.5"
+        return None, None
+
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI", return_value=MagicMock()):
+        with pytest.raises(RuntimeError, match="no API key was found"):
+            AIAgent(
+                provider="alibaba-coding-plan",
+                model="qwen3.6-plus",
+                api_key=None,
+                base_url=None,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=[{
+                    "provider": "tencent-token-plan",
+                    "model": "kimi2.5",
+                    "activate_on": ["timeout", "overloaded", "server_error", "rate_limit"],
+                }],
+            )
+    assert fallback_resolver_called is False
+
+
 def test_init_raises_when_no_fallback_configured():
     """When primary returns None and no fallback is set, should raise."""
     with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \

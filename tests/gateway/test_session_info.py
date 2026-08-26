@@ -154,3 +154,43 @@ class TestResetNoticeSessionInfo:
         assert "anthropic" in info
         assert "base-model" not in info
 
+    def test_channel_override_model_is_shown_in_reset_notice(self, runner, tmp_path):
+        """A reset banner must describe the route this channel will actually use."""
+        from types import SimpleNamespace
+        from gateway.config import ChannelOverride, Platform
+        from gateway.session import SessionSource
+
+        runner.config = SimpleNamespace(
+            multiplex_profiles=False,
+            platforms={
+                Platform.DISCORD: SimpleNamespace(
+                    channel_overrides={
+                        "fastanswers": ChannelOverride(
+                            model="gpt-5.6-terra", provider="openai-codex"
+                        )
+                    }
+                )
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id="fastanswers", user_id="u1"
+        )
+        runtime = {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "k",
+        }
+        with patch("gateway.run._hermes_home", tmp_path), \
+             patch.object(
+                runner,
+                "_resolve_model_for_channel",
+                return_value="gpt-5.6-terra",
+             ), patch(
+                "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                return_value=runtime,
+             ):
+            info = runner._reset_notice_session_info(source)
+
+        assert "gpt-5.6-terra" in info
+        assert "openai-codex" in info
+

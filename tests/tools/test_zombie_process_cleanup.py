@@ -462,6 +462,7 @@ class TestDelegationCleanup:
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
+        child_closed = threading.Event()
         parent = MagicMock()
         parent._active_children = []
         parent._active_children_lock = threading.Lock()
@@ -469,6 +470,14 @@ class TestDelegationCleanup:
         child.session_id = "timed-out-child"
         child._delegate_saved_tool_names = ["tool1"]
         child.get_activity_summary.return_value = {"api_call_count": 1}
+
+        def close_child():
+            # Resource teardown is unsafe until run_conversation has fully
+            # returned: it closes the child's owned SessionDB and HTTP clients.
+            assert child_finished.is_set()
+            child_closed.set()
+
+        child.close.side_effect = close_child
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
@@ -519,9 +528,12 @@ class TestDelegationCleanup:
                 session_id=child.session_id,
             )
             relay_host.unregister_subagent.assert_not_called()
+            child.close.assert_not_called()
 
             release_child.set()
             assert child_finished.wait(timeout=5)
+            assert child_closed.wait(timeout=5)
+            child.close.assert_called_once_with()
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,

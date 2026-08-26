@@ -1004,6 +1004,117 @@ class TestOpenRouterPaidLaneGuard:
         assert model is None
         mock_openai.assert_not_called()
 
+    def test_allow_openrouter_false_disables_auxiliary_route_even_with_key(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"allow_openrouter": False}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = _try_openrouter()
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_allow_openrouter_false_does_not_block_main_provider_resolution(self):
+        from agent.auxiliary_client import resolve_provider_client
+
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"allow_openrouter": False}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="main_openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = resolve_provider_client(
+                "openrouter",
+                model="openrouter/auto",
+                explicit_api_key="or-main-key",
+            )
+        assert client is mock_client
+        assert model == "openrouter/auto"
+        mock_openai.assert_called_once()
+
+    def test_allow_openrouter_false_blocks_auxiliary_provider_resolution(self):
+        from agent.auxiliary_client import resolve_provider_client
+
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"allow_openrouter": False}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = resolve_provider_client(
+                "openrouter",
+                model="openrouter/auto",
+                explicit_api_key="or-aux-key",
+                auxiliary_policy=True,
+            )
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_allow_openrouter_false_blocks_custom_openrouter_url(self):
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"allow_openrouter": False}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = resolve_provider_client(
+                "custom",
+                model="openrouter/auto",
+                explicit_base_url="https://openrouter.ai/api/v1",
+                explicit_api_key="or-custom-key",
+                auxiliary_policy=True,
+            )
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_allow_openrouter_false_blocks_explicit_vision_url(self):
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"allow_openrouter": False}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            provider, client, model = resolve_vision_provider_client(
+                provider="custom",
+                model="openrouter/auto",
+                base_url="https://openrouter.ai/api/v1",
+                api_key="or-vision-key",
+            )
+        assert provider == "custom"
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_allow_openrouter_false_evicts_cached_openrouter_client(self):
+        from agent.auxiliary_client import (
+            _client_cache,
+            _client_cache_key,
+            _client_cache_lock,
+            _get_cached_client,
+        )
+
+        cached_client = MagicMock(name="cached_openrouter")
+        cached_client.base_url = "https://openrouter.ai/api/v1"
+        cache_key = _client_cache_key(
+            "openrouter",
+            async_mode=False,
+            api_key="or-cache-key",
+            model="openrouter/auto",
+        )
+        with _client_cache_lock:
+            _client_cache.clear()
+            _client_cache[cache_key] = (cached_client, "openrouter/auto", None)
+        try:
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={"auxiliary": {"allow_openrouter": False}}), \
+                 patch("agent.auxiliary_client.OpenAI") as mock_openai:
+                client, model = _get_cached_client(
+                    "openrouter",
+                    "openrouter/auto",
+                    api_key="or-cache-key",
+                )
+            assert client is None
+            assert model == "openrouter/auto"  # model hint is preserved without a client
+            mock_openai.assert_not_called()
+            with _client_cache_lock:
+                assert cache_key not in _client_cache
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
+
     def test_free_only_allows_free_model(self, monkeypatch):
         """free_only=true + :free model → OpenRouter used with that model."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -4363,6 +4474,7 @@ class TestSynchronousFallbackCachePlans:
                 "explicit_base_url": "https://api.anthropic.com",
                 "explicit_api_key": None,
                 "api_mode": "anthropic_messages",
+                "auxiliary_policy": True,
             },
         )]
         wire_tools = client.chat.completions.create.call_args.kwargs["tools"]

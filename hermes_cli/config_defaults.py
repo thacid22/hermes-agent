@@ -1064,6 +1064,9 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # Whether auxiliary/background tasks may use OpenRouter at all. This
+        # is independent of the main agent's fallback_providers chain.
+        "allow_openrouter": True,
         # Restrict the auxiliary auto-chain's OpenRouter fallback to free
         # (:free) SKUs. When true, the OpenRouter step is skipped entirely
         # unless the resolved fallback model ends in ":free" — a PAID lane
