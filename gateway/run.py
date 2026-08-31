@@ -1347,8 +1347,10 @@ def build_resume_recovery_note(
     elif interactive:
         resume_guidance = (
             "Do NOT emit a 'session restored' acknowledgement, ask what to "
-            "do next, or ask whether to continue. Review the conversation "
-            "history and CONTINUE the interrupted task to completion."
+            "do next, ask whether to continue, or ask clarifying questions for "
+            "non-destructive ambiguity. Review the conversation history and "
+            "CONTINUE the interrupted task to completion, choosing the safest "
+            "reasonable default when details are underspecified."
         )
         tail_guidance = (
             "Do NOT re-run tool calls whose results already appear in the "
