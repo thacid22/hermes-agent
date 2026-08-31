@@ -111,6 +111,45 @@ class TestResolveChannelPrompts:
         adapter.config.extra = {"channel_prompts": {"100": "Research mode"}}
         assert adapter._resolve_channel_prompt("100") == "Research mode"
 
+    def test_wildcard_prompt_applies_to_every_channel(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"*": "Unattended mode"}}
+        assert adapter._resolve_channel_prompt("100") == "Unattended mode"
+        assert adapter._resolve_channel_prompt("future-channel") == "Unattended mode"
+
+    def test_wildcard_and_channel_prompt_are_combined(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "*": "Unattended mode",
+                "100": "Research mode",
+            }
+        }
+        assert (
+            adapter._resolve_channel_prompt("100")
+            == "Unattended mode\n\nResearch mode"
+        )
+
+    def test_wildcard_and_parent_prompt_are_combined_for_threads(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "*": "Unattended mode",
+                "100": "Parent research mode",
+            }
+        }
+        assert (
+            adapter._resolve_channel_prompt("thread-1", "100")
+            == "Unattended mode\n\nParent research mode"
+        )
+
+    def test_duplicate_specific_prompt_is_not_repeated(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {"*": "Same policy", "100": "Same policy"}
+        }
+        assert adapter._resolve_channel_prompt("100") == "Same policy"
+
     def test_numeric_yaml_keys_normalized_at_config_load(self):
         """Numeric YAML keys are normalized to strings by config bridging.
 

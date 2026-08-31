@@ -2874,15 +2874,22 @@ def resolve_channel_prompt(
     """Resolve a per-channel ephemeral prompt from platform config.
 
     Looks up ``channel_prompts`` in the adapter's ``config.extra`` dict.
-    Prefers an exact match on *channel_id*; falls back to *parent_id*
-    (useful for forum threads / child channels inheriting a parent prompt).
+    A ``"*"`` entry is a global policy that is prepended for every channel.
+    An exact *channel_id* prompt wins over a *parent_id* prompt and is appended
+    after the global policy. This lets platform-wide operating rules coexist
+    with channel-specific task context.
 
-    Returns the prompt string, or None if no match is found.  Blank/whitespace-
-    only prompts are treated as absent.
+    Returns the combined prompt, or None if no non-blank prompt is configured.
+    Blank/whitespace-only prompts are treated as absent.
     """
     prompts = config_extra.get("channel_prompts") or {}
     if not isinstance(prompts, dict):
         return None
+
+    parts: list[str] = []
+    global_prompt = str(prompts.get("*") or "").strip()
+    if global_prompt:
+        parts.append(global_prompt)
 
     for key in (channel_id, parent_id):
         if not key:
@@ -2891,9 +2898,11 @@ def resolve_channel_prompt(
         if prompt is None:
             continue
         prompt = str(prompt).strip()
+        if prompt and prompt not in parts:
+            parts.append(prompt)
         if prompt:
-            return prompt
-    return None
+            break
+    return "\n\n".join(parts) or None
 
 
 def resolve_channel_skills(
