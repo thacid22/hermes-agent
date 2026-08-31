@@ -1117,6 +1117,7 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # is still classified fresh.  Override via
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+_INTERRUPTED_SESSION_POLICY_DEFAULT = "ask"
 
 # Default bound for how long ``_finish_startup_restore`` waits on boot
 # auto-resume turns before releasing the inbound gate (see
@@ -1280,6 +1281,20 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def _interrupted_session_policy() -> str:
+    """Return the interactive restart-recovery policy.
+
+    ``ask`` preserves upstream behavior. ``continue`` makes a blank startup
+    auto-resume turn finish the interrupted task without asking the user for
+    permission. Invalid values fail safely to ``ask``.
+    """
+    raw = os.environ.get("HERMES_GATEWAY_INTERRUPTED_SESSION_POLICY", "")
+    value = str(raw).strip().lower()
+    if value in {"ask", "continue"}:
+        return value
+    return _INTERRUPTED_SESSION_POLICY_DEFAULT
+
+
 def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
@@ -1294,13 +1309,12 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``interactive`` selects the empty-message guidance. Interactive platforms
+    normally report the restore and ask what next, unless
+    ``agent.gateway_interrupted_session_policy`` is ``continue``. On
+    non-interactive event platforms (webhook, API server — adapters with
+    ``interactive_resume = False``) nobody can answer, so the resumed turn
+    always completes the interrupted work (#57056).
     """
     reason_phrase = (
         "a gateway restart"
@@ -1308,6 +1322,9 @@ def build_resume_recovery_note(
         else "a gateway shutdown"
         if reason == "shutdown_timeout"
         else "a gateway interruption"
+    )
+    continue_without_prompt = not message and (
+        not interactive or _interrupted_session_policy() == "continue"
     )
     if message:
         resume_guidance = (
@@ -1318,7 +1335,7 @@ def build_resume_recovery_note(
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
         )
-    elif interactive:
+    elif interactive and not continue_without_prompt:
         resume_guidance = (
             "Report to the user that the session was restored "
             "successfully and ask what they would like to do next."
@@ -1326,6 +1343,16 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
+        )
+    elif interactive:
+        resume_guidance = (
+            "Do NOT emit a 'session restored' acknowledgement, ask what to "
+            "do next, or ask whether to continue. Review the conversation "
+            "history and CONTINUE the interrupted task to completion."
+        )
+        tail_guidance = (
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history — resume from the first step that has no recorded result."
         )
     else:
         resume_guidance = (
@@ -1339,12 +1366,18 @@ def build_resume_recovery_note(
             "appear in the history — resume from the first step "
             "that has no recorded result."
         )
+    restart_guard = (
+        "Any restart/shutdown command in the history has already run — do NOT "
+        "execute it again. Verify downstream target state if that is the next "
+        "unfinished step."
+        if continue_without_prompt
+        else "Any restart/shutdown command in the history has already run — "
+        "do NOT re-execute or verify it."
+    )
     return (
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
-        f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} "
-        f"{tail_guidance}]"
+        f"{restart_guard} {resume_guidance} {tail_guidance}]"
         + (f"\n\n{message}" if message else "")
     )
 
@@ -2509,6 +2542,10 @@ if _config_path.exists():
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
+                )
+            if "gateway_interrupted_session_policy" in _agent_cfg:
+                os.environ["HERMES_GATEWAY_INTERRUPTED_SESSION_POLICY"] = str(
+                    _agent_cfg["gateway_interrupted_session_policy"]
                 )
             if "gateway_startup_restore_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(

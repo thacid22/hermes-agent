@@ -314,6 +314,46 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_empty_message_interactive_default_asks(self, monkeypatch):
+        """The new setting must preserve upstream behaviour by default."""
+        monkeypatch.delenv(
+            "HERMES_GATEWAY_INTERRUPTED_SESSION_POLICY", raising=False
+        )
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True
+        )
+        assert "session was restored" in note
+        assert "ask what they would like to do next" in note
+        assert "CONTINUE the interrupted task" not in note
+        assert "do NOT re-execute or verify it" in note
+
+    def test_empty_message_interactive_continue_policy_resumes(self, monkeypatch):
+        """Configured interactive sessions continue without user confirmation."""
+        monkeypatch.setenv(
+            "HERMES_GATEWAY_INTERRUPTED_SESSION_POLICY", "continue"
+        )
+        note = build_resume_recovery_note(
+            "shutdown_timeout", "", interactive=True
+        )
+        assert "CONTINUE the interrupted task" in note
+        assert "session was restored" not in note
+        assert "ask what they would like to do next" not in note
+        assert "ask whether to continue" in note
+        assert "already appear in the history" in note
+        assert "do NOT execute it again" in note
+        assert "Verify downstream target state" in note
+        assert "do NOT re-execute or verify it" not in note
+
+    def test_empty_message_interactive_invalid_policy_fails_to_ask(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_GATEWAY_INTERRUPTED_SESSION_POLICY", "unexpected"
+        )
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True
+        )
+        assert "session was restored" in note
+        assert "ask what they would like to do next" in note
+
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""

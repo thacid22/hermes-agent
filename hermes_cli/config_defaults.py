@@ -315,6 +315,13 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # What a blank startup auto-resume turn should do on interactive
+        # messaging platforms after a gateway restart interrupted active work.
+        # "ask" preserves the upstream acknowledgement-and-confirmation
+        # behaviour; "continue" resumes the unfinished task immediately while
+        # still refusing to repeat tool calls whose results are already in the
+        # transcript.
+        "gateway_interrupted_session_policy": "ask",
         # Max seconds the gateway waits for boot auto-resume turns to finish
         # before it releases the startup-restore inbound gate.  While startup
         # restore is in progress the gateway QUEUES every inbound message
