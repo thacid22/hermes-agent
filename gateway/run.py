@@ -3157,7 +3157,10 @@ class _GatewayModelContext:
     context_source: str
 
 
-def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModelContext:
+def _resolve_gateway_model_context(
+    model: Optional[str] = None,
+    runtime_kwargs: Optional[dict] = None,
+) -> _GatewayModelContext:
     """Resolve the configured gateway route and its effective context window.
 
     This is the shared non-resident authority for status/session banners and
@@ -3202,7 +3205,11 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         pass
 
     try:
-        runtime = _resolve_runtime_agent_kwargs()
+        runtime = (
+            runtime_kwargs
+            if runtime_kwargs is not None
+            else _resolve_runtime_agent_kwargs()
+        )
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
@@ -22407,17 +22414,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source)
+        return self._format_session_info(source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
+
+        When a session source is available, resolve the model and runtime as
+        one effective route. This keeps provider, endpoint, and context
+        metadata aligned with channel/thread model routing instead of mixing a
+        channel model with the global provider route.
         """
-        resolved = _resolve_gateway_model_context()
+        model = None
+        runtime_kwargs = None
+        if source is not None:
+            user_config = _load_gateway_runtime_config()
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                user_config=user_config,
+            )
+        resolved = _resolve_gateway_model_context(
+            model=model,
+            runtime_kwargs=runtime_kwargs,
+        )
         model = resolved.model
         provider = resolved.provider
         base_url = resolved.base_url
